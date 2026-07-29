@@ -22,6 +22,47 @@ const mcpInstructions = "onvif-proxy management server: wrap RTSP streams as vir
 	"Use list_devices/get_status to inspect, probe_rtsp/get_stream_info before adding a device, " +
 	"add_device/update_device/delete_device to manage, run_onvif_selftest to verify."
 
+// Annotation hints for the MCP tool set (docs/07 §2.1). Per the MCP spec, an
+// unannotated tool is treated as the worst case by clients — ReadOnlyHint
+// defaults to false and DestructiveHint defaults to true — so every tool
+// below gets an explicit annotation rather than relying on that default.
+//
+// These are hints for client UIs only, never a security boundary: the spec
+// says a malicious server can misreport them, so annotating a tool must never
+// be used as a reason to remove or weaken the actual validation logic
+// (validateRTSPURL, withOriginCheck, etc. stay exactly as they are).
+var (
+	// annoReadOnly: pure reads of local proxy state, no external interaction.
+	annoReadOnly = &mcp.ToolAnnotations{ReadOnlyHint: true}
+	// annoReadOnlyOpenWorld: read-only, but the read reaches out to an
+	// external entity (an RTSP camera at a caller-supplied URL) rather than
+	// just local state.
+	annoReadOnlyOpenWorld = &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: boolPtr(true)}
+	// annoSelfTest: read-only, but explicitly closed-world — it calls the
+	// proxy's own ONVIF SOAP endpoints on 127.0.0.1 (onvif_selftest.go), not
+	// an external/foreign entity, so OpenWorldHint is pinned to false rather
+	// than left at its true default.
+	annoSelfTest = &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: boolPtr(false)}
+	// annoWrite: additive, non-destructive side effect; not idempotent
+	// because repeating it creates another entry (add_device: every call
+	// appends a device that gets a freshly generated uuid/mac/serial on
+	// reload, so identical arguments do not converge to one device).
+	annoWrite = &mcp.ToolAnnotations{DestructiveHint: boolPtr(false), IdempotentHint: false}
+	// annoWriteIdempotent: additive/replacing, non-destructive, and repeat
+	// calls with the same arguments converge to the same state.
+	annoWriteIdempotent = &mcp.ToolAnnotations{DestructiveHint: boolPtr(false), IdempotentHint: true}
+	// annoDestructive: removes state irreversibly. Still idempotent: a
+	// second call against an already-deleted target converges to the same
+	// end state (device absent), even though that second call itself
+	// reports a business error.
+	annoDestructive = &mcp.ToolAnnotations{DestructiveHint: boolPtr(true), IdempotentHint: true}
+)
+
+// boolPtr is a small helper for the *bool annotation fields (DestructiveHint,
+// OpenWorldHint), which are pointers so "unset" is distinguishable from
+// "explicitly false".
+func boolPtr(b bool) *bool { return &b }
+
 // mcpHandler builds the Streamable HTTP endpoint mounted at /mcp. The SDK owns
 // the whole protocol surface (lifecycle, SSE, method negotiation); we only
 // register the tool set. A fresh mcp.Server is built per request because the
@@ -35,29 +76,41 @@ func (s *Server) mcpHandler() http.Handler {
 		}, &mcp.ServerOptions{Instructions: mcpInstructions})
 
 		mcp.AddTool(srv, &mcp.Tool{Name: "get_status",
-			Description: "Coarse runtime status: version, advertise IP, uptime and whether ffmpeg is available."}, s.mcpGetStatus)
+			Description: "Coarse runtime status: version, advertise IP, uptime and whether ffmpeg is available.",
+			Annotations: annoReadOnly}, s.mcpGetStatus)
 		mcp.AddTool(srv, &mcp.Tool{Name: "list_devices",
-			Description: "List the running virtual ONVIF devices with their ONVIF/RTSP endpoints."}, s.mcpListDevices)
+			Description: "List the running virtual ONVIF devices with their ONVIF/RTSP endpoints.",
+			Annotations: annoReadOnly}, s.mcpListDevices)
 		mcp.AddTool(srv, &mcp.Tool{Name: "get_config",
-			Description: "Return the current config.yaml text verbatim."}, s.mcpGetConfig)
+			Description: "Return the current config.yaml text verbatim.",
+			Annotations: annoReadOnly}, s.mcpGetConfig)
 		mcp.AddTool(srv, &mcp.Tool{Name: "apply_config",
-			Description: "Validate and (unless dry_run) persist and hot-reload a full config.yaml. Rejected configs return the validation error."}, s.mcpApplyConfig)
+			Description: "Validate and (unless dry_run) persist and hot-reload a full config.yaml. Rejected configs return the validation error.",
+			Annotations: annoWriteIdempotent}, s.mcpApplyConfig)
 		mcp.AddTool(srv, &mcp.Tool{Name: "add_device",
-			Description: "Append a virtual device built from the given definition and hot-reload."}, s.mcpAddDevice)
+			Description: "Append a virtual device built from the given definition and hot-reload.",
+			Annotations: annoWrite}, s.mcpAddDevice)
 		mcp.AddTool(srv, &mcp.Tool{Name: "update_device",
-			Description: "Replace the device with the given uuid, preserving its identity (uuid/mac/serial/info). A blank password with an unchanged username keeps the existing password."}, s.mcpUpdateDevice)
+			Description: "Replace the device with the given uuid, preserving its identity (uuid/mac/serial/info). A blank password with an unchanged username keeps the existing password.",
+			Annotations: annoWriteIdempotent}, s.mcpUpdateDevice)
 		mcp.AddTool(srv, &mcp.Tool{Name: "delete_device",
-			Description: "Remove the device with the given uuid and hot-reload."}, s.mcpDeleteDevice)
+			Description: "Remove the device with the given uuid and hot-reload.",
+			Annotations: annoDestructive}, s.mcpDeleteDevice)
 		mcp.AddTool(srv, &mcp.Tool{Name: "probe_rtsp",
-			Description: "Probe an rtsp:// URL and report reachability, auth mode and advertised tracks."}, s.mcpProbeRTSP)
+			Description: "Probe an rtsp:// URL and report reachability, auth mode and advertised tracks.",
+			Annotations: annoReadOnlyOpenWorld}, s.mcpProbeRTSP)
 		mcp.AddTool(srv, &mcp.Tool{Name: "get_stream_info",
-			Description: "Run ffprobe against an rtsp:// URL and return the first video stream's codec, resolution, frame rate and bitrate. Requires ffmpeg."}, s.mcpGetStreamInfo)
+			Description: "Run ffprobe against an rtsp:// URL and return the first video stream's codec, resolution, frame rate and bitrate. Requires ffmpeg.",
+			Annotations: annoReadOnlyOpenWorld}, s.mcpGetStreamInfo)
 		mcp.AddTool(srv, &mcp.Tool{Name: "take_snapshot",
-			Description: "Grab a single JPEG frame from a device stream, returned as an image. Requires ffmpeg."}, s.mcpTakeSnapshot)
+			Description: "Grab a single JPEG frame from a device stream, returned as an image. Requires ffmpeg.",
+			Annotations: annoReadOnlyOpenWorld}, s.mcpTakeSnapshot)
 		mcp.AddTool(srv, &mcp.Tool{Name: "run_onvif_selftest",
-			Description: "Exercise the proxy's own ONVIF services for a device and report the per-method pass/fault matrix."}, s.mcpRunSelfTest)
+			Description: "Exercise the proxy's own ONVIF services for a device and report the per-method pass/fault matrix.",
+			Annotations: annoSelfTest}, s.mcpRunSelfTest)
 		mcp.AddTool(srv, &mcp.Tool{Name: "get_discovery_log",
-			Description: "Return the recent WS-Discovery interactions."}, s.mcpGetDiscoveryLog)
+			Description: "Return the recent WS-Discovery interactions.",
+			Annotations: annoReadOnly}, s.mcpGetDiscoveryLog)
 
 		return srv
 	}

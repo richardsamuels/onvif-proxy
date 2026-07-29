@@ -279,7 +279,61 @@ func TestMCPBareHTTPGuards(t *testing.T) {
 	}
 }
 
-// 8. take_snapshot returns an image block whose bytes equal the JPEG the fake
+// 8. tools/list must carry the annotation hints documented in docs/07 §2.1:
+//    read-only tools set ReadOnlyHint, the RTSP/ONVIF-facing reads additionally
+//    set OpenWorldHint, delete_device is the only DestructiveHint=true tool,
+//    and add_device is the only mutating tool that is not idempotent.
+func TestMCPToolAnnotations(t *testing.T) {
+	ctx := testCtx(t)
+	session := connectMCP(t, ctx, newMCPServer(t, newTestBackend(t)))
+
+	res, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	byName := map[string]*mcp.Tool{}
+	for _, tool := range res.Tools {
+		byName[tool.Name] = tool
+	}
+
+	boolPtr := func(v *bool) bool { return v != nil && *v }
+
+	// get_status: plain read of local state — read-only, no open-world hint.
+	if a := byName["get_status"].Annotations; a == nil || !a.ReadOnlyHint || boolPtr(a.OpenWorldHint) {
+		t.Fatalf("get_status annotations = %+v, want ReadOnlyHint=true, OpenWorldHint unset/false", a)
+	}
+
+	// probe_rtsp: read-only, but reaches an external RTSP endpoint.
+	if a := byName["probe_rtsp"].Annotations; a == nil || !a.ReadOnlyHint || !boolPtr(a.OpenWorldHint) {
+		t.Fatalf("probe_rtsp annotations = %+v, want ReadOnlyHint=true, OpenWorldHint=true", a)
+	}
+
+	// delete_device: the only destructive tool; still idempotent (repeated
+	// deletes converge to "device absent").
+	if a := byName["delete_device"].Annotations; a == nil || a.ReadOnlyHint || !boolPtr(a.DestructiveHint) || !a.IdempotentHint {
+		t.Fatalf("delete_device annotations = %+v, want ReadOnlyHint=false, DestructiveHint=true, IdempotentHint=true", a)
+	}
+
+	// add_device: mutating, non-destructive, but not idempotent (each call
+	// appends another device with freshly generated identity).
+	if a := byName["add_device"].Annotations; a == nil || a.ReadOnlyHint || boolPtr(a.DestructiveHint) || a.IdempotentHint {
+		t.Fatalf("add_device annotations = %+v, want ReadOnlyHint=false, DestructiveHint=false, IdempotentHint=false", a)
+	}
+
+	// update_device: mutating, non-destructive, idempotent (replaces by uuid).
+	if a := byName["update_device"].Annotations; a == nil || a.ReadOnlyHint || boolPtr(a.DestructiveHint) || !a.IdempotentHint {
+		t.Fatalf("update_device annotations = %+v, want ReadOnlyHint=false, DestructiveHint=false, IdempotentHint=true", a)
+	}
+
+	// No tool may be left unannotated: every entry must carry non-nil hints.
+	for _, tool := range res.Tools {
+		if tool.Annotations == nil {
+			t.Fatalf("tool %q has no annotations", tool.Name)
+		}
+	}
+}
+
+// 9. take_snapshot returns an image block whose bytes equal the JPEG the fake
 //    backend produced. The SDK already base64-decodes on the wire, so
 //    ImageContent.Data holds the raw bytes directly.
 func TestMCPTakeSnapshot(t *testing.T) {

@@ -2,7 +2,9 @@
 
 [English](03-config.md) | **简体中文**
 
-配置文件为 YAML,默认路径 `./config.yaml`(可用 `-config` 参数或 `CONFIG` 环境变量覆盖)。Web UI 的修改经校验后**原子写回**同一文件;程序自动生成的持久化字段(uuid、mac)也会写回。少量全局字段支持环境变量运行时覆盖(见第 3 节),便于 Docker 部署时免挂载改配置。
+配置文件为 YAML,默认路径 `./config.yaml`(可用 `-config` 参数或 `CONFIG` 环境变量覆盖)。配置可能包含 RTSP/Web 密码,因此创建和重写时均使用仅所有者可读写的 `0600` 权限。Web UI 的修改经校验后**原子写回**同一文件;程序自动生成的持久化字段(uuid、mac)也会写回。少量全局字段支持环境变量运行时覆盖(见第 3 节),便于 Docker 部署时免挂载改配置。
+
+热重载可实时应用设备配置、`server.advertise_ip`、`server.discovery` 和 Web 凭证。通过 API 修改 `web.enabled` 或 `web.port` 需要重启进程,因此接口会拒绝并且不落盘;启动时的环境变量覆盖不受影响,包括 `ONVIF_WEB_ENABLED` 和 `ONVIF_WEB_PORT`。
 
 ## 1. 完整示例
 
@@ -48,18 +50,21 @@ devices:
     streams:
       - name: main               # profile token = profile_main;每设备内唯一
         rtsp: "rtsp://user:pass@192.168.1.50:554/h264/ch1/main/av_stream"
+        codec: h264              # h264(默认)、jpeg/MJPEG 或 mpeg4
         width: 2560
         height: 1440
         framerate: 25
         bitrate: 4096            # kbps,仅用于能力通告
       - name: sub
         rtsp: "rtsp://user:pass@192.168.1.50:554/h264/ch1/sub/av_stream"
+        codec: h264
         width: 640
         height: 360
         framerate: 15
         bitrate: 512
       - name: mobile             # 第三条、第四条…随意加
         rtsp: "rtsp://user:pass@192.168.1.50:554/h264/ch1/mobile/av_stream"
+        codec: h264
         width: 352
         height: 288
         framerate: 10
@@ -77,6 +82,7 @@ devices:
     streams:
       - name: main
         rtsp: "rtsp://admin:pw@192.168.1.60:554/cam/realmonitor?channel=3&subtype=0"
+        codec: h264
         width: 1920
         height: 1080
         framerate: 20
@@ -89,7 +95,7 @@ devices:
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `advertise_ip` | string | 自动探测 | 写进 XAddrs / StreamUri / SnapshotUri 的 IP。**HTTP 响应内的 URI 优先使用请求的 Host 头**(NAT 友好),此字段主要供 WS-Discovery 使用 |
+| `advertise_ip` | string | 自动探测 | 写进 XAddrs / StreamUri / SnapshotUri 的合法 IPv4 地址。**HTTP 响应内的 URI 优先使用请求的 Host 头**(NAT 友好),此字段主要供 WS-Discovery 使用 |
 | `discovery` | bool | true | 是否启动 UDP 3702 |
 
 ### devices[]
@@ -97,15 +103,17 @@ devices:
 | 字段 | 必填 | 校验 |
 |------|:---:|------|
 | `name` | ✅ | 非空;进入 scope 时做 URL 编码 |
-| `uuid` / `mac` / `serial` | — | 空则生成后**写回文件**;uuid 须为合法 UUID,mac 须为合法 MAC |
+| `uuid` / `mac` / `serial` | — | 空则生成后**写回文件**;uuid 须为合法 UUID,mac 须为 6 字节 MAC-48 地址 |
 | `ports.soap` / `ports.rtsp` | ✅ | 1-65535;**全体设备 + web 端口两两不冲突**(校验失败拒绝加载/保存) |
 | `streams[]` | ✅ | 至少 1 条;每条 → 一个 ONVIF Profile。`name` 设备内唯一(小写字母数字/下划线,进入 token:`profile_<name>` / `vec_<name>`);第一条为主流 |
 | `streams[].rtsp` | ✅ | 必须为 `rtsp://` scheme;可含 userinfo;host、path 解析后用于代理目标与 StreamUri 路径 |
+| `streams[].codec` | — | `h264`(默认)、`jpeg`(含 MJPEG 源)或 `mpeg4`;决定 ONVIF `Encoding`、编码专属配置节点、Options 和保证实例计数。Profile S 没有 H.265 编码,因此拒绝 H.265/HEVC |
 | `streams[].width/height/framerate/bitrate` | ✅ | 正整数;仅用于 ONVIF 能力通告,不影响真实流 |
-| `streams[].proxy_port` | — | 该流上游 host:port 与主流不同时**必填**(独立代理监听);相同则省略,共用 `ports.rtsp` |
-| `auth` | — | 提供则 username/password 均非空。**与 RTSP 凭证是独立的两层**:auth 保护虚拟设备的 ONVIF 接口(WSSE),RTSP 认证由客户端与真实摄像头端到端完成。省略 = 全放行(推荐);要配则建议与摄像头 RTSP 账密一致(Unifi Protect 只填一组账密并同时用于两层) |
-| `snapshot.url` | — | 填了走透传模式;`http(s)://` scheme |
+| `streams[].proxy_port` | — | 该流上游 host:port 与主流不同时**必填**;同一非主上游的所有流必须复用相同值,同一端口不得指向不同上游。与主流同上游时省略,共用 `ports.rtsp` |
+| `auth` | — | 提供则 username/password 均非空。**与 RTSP 凭证是独立的两层**:auth 通过 WSSE 保护 SOAP、通过 Basic 认证保护 HTTP 快照端点,RTSP 认证仍由客户端与真实摄像头端到端完成。省略 = 全放行(推荐);要配则建议与摄像头 RTSP 账密一致(Unifi Protect 只填一组账密并同时用于两层)。HTTP Basic 不加密凭证,快照端点只应暴露在可信网络或 TLS 之后 |
+| `snapshot.url` | — | 填了走透传模式;必须是带主机名的绝对 `http(s)://` URL |
 | `snapshot.stream` | — | ffmpeg 抓帧模式下的取帧流名,默认 `streams[0].name` |
+| `snapshot.cache_seconds` | — | 快照缓存秒数;`0` 使用默认 10 秒,不允许负数 |
 
 ### RTSP URL 的拆解逻辑
 
@@ -113,7 +121,9 @@ devices:
 
 - **代理目标**:`host:port`(TCP 透传的对端);
 - **StreamUri 返回值**:`rtsp://<advertise>:<代理端口>/path?query` —— **凭证不出现在 StreamUri 中**,RTSP 认证由客户端与真实摄像头端到端完成(客户端里录入的摄像头凭证 = 真实摄像头凭证);
-- **多流的代理端口分配**:与主流同 `host:port` 的流共用 `ports.rtsp`;上游不同的流必须显式给 `proxy_port`(每个独立上游一个监听端口)。校验器检查所有 (soap/rtsp/proxy_port/web) 端口全局不冲突。
+- **多流的代理端口分配**:与主流同 `host:port` 的流共用 `ports.rtsp`;同一非主上游的多条流显式复用一个 `proxy_port`(每个独立上游一个监听端口)。同一端口不得分配给两个上游,校验器还会检查 soap/rtsp/proxy/web 端口的全局冲突。
+
+YAML 只允许一个文档。设备或流中的 `null` 项、未知字段、额外的 `---` 文档及尾随 YAML 内容都会被拒绝。
 
 ### 端口规划建议
 

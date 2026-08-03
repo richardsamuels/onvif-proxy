@@ -39,6 +39,13 @@ type mockBackend struct {
 	devices    []DeviceRuntime
 }
 
+type dynamicWebBackend struct {
+	*mockBackend
+	web config.WebConfig
+}
+
+func (b *dynamicWebBackend) WebConfig() config.WebConfig { return b.web }
+
 func (m *mockBackend) ConfigYAML() ([]byte, error) { return m.yaml, nil }
 func (m *mockBackend) ApplyConfig(raw []byte, dryRun bool) error {
 	m.applied = raw
@@ -97,6 +104,35 @@ func TestPutConfigDryRun(t *testing.T) {
 	}
 }
 
+func TestOversizedRequestBodiesReturn413(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		prefix string
+		limit  int
+	}{
+		{"config", http.MethodPut, "/api/config", testYAML, maxConfigBodyBytes},
+		{"add device", http.MethodPost, "/api/devices", addDeviceBody, maxDeviceBodyBytes},
+		{"rtsp probe", http.MethodPost, "/api/test/rtsp", `{"url":"rtsp://192.0.2.1/main"}`, maxProbeBodyBytes},
+		{"stream info", http.MethodPost, "/api/test/streaminfo", `{"url":"rtsp://192.0.2.1/main"}`, maxProbeBodyBytes},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := newTestBackend(t)
+			s := New(config.WebConfig{Port: 8080}, b)
+			body := tt.prefix + strings.Repeat(" ", tt.limit-len(tt.prefix)+1)
+			rec := do(s, httptest.NewRequest(tt.method, tt.path, strings.NewReader(body)))
+			if rec.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status = %d, want 413; body=%s", rec.Code, rec.Body.String())
+			}
+			if b.applied != nil {
+				t.Fatal("oversized body reached ApplyConfig")
+			}
+		})
+	}
+}
+
 func TestDevices(t *testing.T) {
 	s := New(config.WebConfig{Port: 8080}, newTestBackend(t))
 	rec := do(s, httptest.NewRequest(http.MethodGet, "/api/devices", nil))
@@ -117,6 +153,15 @@ func TestDevices(t *testing.T) {
 	want := "rtsp://10.0.0.1:8554/ch1/main"
 	if st[0].RTSPURI != want {
 		t.Fatalf("rtsp_uri = %q, want %q", st[0].RTSPURI, want)
+	}
+	if st[0].RTSP != "rtsp://192.168.1.50:554/ch1/main" || !st[0].HasCredentials {
+		t.Fatalf("upstream credentials were not safely represented: %+v", st[0])
+	}
+	if st[0].Codec != "h264" {
+		t.Fatalf("default codec = %q, want h264", st[0].Codec)
+	}
+	if strings.Contains(rec.Body.String(), "user:pass") {
+		t.Fatalf("GET /api/devices leaked RTSP credentials: %s", rec.Body.String())
 	}
 }
 
@@ -158,6 +203,32 @@ func TestBasicAuthChallenge(t *testing.T) {
 	req.SetBasicAuth("admin", "secret")
 	if rec := do(s, req); rec.Code != http.StatusOK {
 		t.Fatalf("authed status = %d", rec.Code)
+	}
+}
+
+func TestBasicAuthCredentialsReloadDynamically(t *testing.T) {
+	b := &dynamicWebBackend{
+		mockBackend: newTestBackend(t),
+		web:         config.WebConfig{Port: 8080, Username: "admin", Password: "old"},
+	}
+	s := New(b.web, b)
+
+	oldReq := httptest.NewRequest(http.MethodGet, "/api/devices", nil)
+	oldReq.SetBasicAuth("admin", "old")
+	if rec := do(s, oldReq); rec.Code != http.StatusOK {
+		t.Fatalf("old credentials status = %d", rec.Code)
+	}
+
+	b.web.Username, b.web.Password = "operator", "new"
+	staleReq := httptest.NewRequest(http.MethodGet, "/api/devices", nil)
+	staleReq.SetBasicAuth("admin", "old")
+	if rec := do(s, staleReq); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("stale credentials status = %d, want 401", rec.Code)
+	}
+	newReq := httptest.NewRequest(http.MethodGet, "/api/devices", nil)
+	newReq.SetBasicAuth("operator", "new")
+	if rec := do(s, newReq); rec.Code != http.StatusOK {
+		t.Fatalf("reloaded credentials status = %d", rec.Code)
 	}
 }
 
@@ -246,8 +317,11 @@ const editDeviceBody = `{
   "soap_port": 8081,
   "rtsp_port": 8554,
   "streams": [
-    {"name": "main", "rtsp": "rtsp://user:pass@192.168.1.99:554/ch9/main",
-     "width": 2560, "height": 1440, "framerate": 30, "bitrate": 6144}
+    {"name": "main", "rtsp": "rtsp://192.168.1.99:554/ch9/main", "codec": "h264",
+     "width": 2560, "height": 1440, "framerate": 30, "bitrate": 6144},
+    {"name": "sub", "rtsp": "rtsp://192.168.1.100:554/ch9/sub", "codec": "jpeg",
+     "width": 640, "height": 360, "framerate": 15, "bitrate": 512,
+     "proxy_port": 8555}
   ]
 }`
 
@@ -275,6 +349,15 @@ func TestEditDeviceSuccess(t *testing.T) {
 	if !strings.Contains(applied, "192.168.1.99") || !strings.Contains(applied, "2560") {
 		t.Fatalf("applied yaml missing new stream values:\n%s", applied)
 	}
+	if !strings.Contains(applied, "user:pass@192.168.1.99") {
+		t.Fatalf("applied yaml dropped retained RTSP credentials:\n%s", applied)
+	}
+	if !strings.Contains(applied, "proxy_port: 8555") {
+		t.Fatalf("applied yaml dropped per-stream proxy_port:\n%s", applied)
+	}
+	if !strings.Contains(applied, "codec: jpeg") {
+		t.Fatalf("applied yaml dropped per-stream codec:\n%s", applied)
+	}
 	// The identity uuid is preserved (the form never carried it).
 	if !strings.Contains(applied, "11111111-2222-3333-4444-555555555555") {
 		t.Fatalf("applied yaml dropped original uuid:\n%s", applied)
@@ -285,6 +368,30 @@ func TestEditDeviceSuccess(t *testing.T) {
 	}
 	if _, err := config.Parse(b.applied); err != nil {
 		t.Fatalf("applied yaml does not re-parse: %v\n%s", err, applied)
+	}
+}
+
+func TestPreserveRTSPCredentialsMatchesStreamNameAfterReorder(t *testing.T) {
+	original := &config.Device{Streams: []*config.Stream{
+		{Name: "main", RTSP: "rtsp://main:secret@192.0.2.10/main"},
+		{Name: "sub", RTSP: "rtsp://sub:secret@192.0.2.11/sub"},
+	}}
+	edited := &config.Device{Streams: []*config.Stream{
+		{Name: "new", RTSP: "rtsp://192.0.2.12/new"},
+		{Name: "sub", RTSP: "rtsp://192.0.2.21/sub"},
+		{Name: "main", RTSP: "rtsp://192.0.2.20/main"},
+	}}
+
+	preserveRTSPCredentials(edited, original)
+
+	if strings.Contains(edited.Streams[0].RTSP, "@") {
+		t.Fatalf("new stream inherited unrelated credentials: %q", edited.Streams[0].RTSP)
+	}
+	if !strings.Contains(edited.Streams[1].RTSP, "sub:secret@") {
+		t.Fatalf("reordered sub stream lost its credentials: %q", edited.Streams[1].RTSP)
+	}
+	if !strings.Contains(edited.Streams[2].RTSP, "main:secret@") {
+		t.Fatalf("reordered main stream lost its credentials: %q", edited.Streams[2].RTSP)
 	}
 }
 

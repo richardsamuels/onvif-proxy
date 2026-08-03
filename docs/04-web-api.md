@@ -6,17 +6,17 @@ The web service listens on `:8080` by default, providing a REST API and an embed
 
 ## 1. REST API
 
-General conventions: JSON responses; error format `{"error": "...", "detail": "..."}`; write operations use `PUT`/`POST` only.
+General conventions: JSON responses; error format `{"error": "...", "detail": "..."}`; write operations use `PUT`/`POST` only. Oversized config/device bodies (1 MiB) and probe JSON bodies (64 KiB) return HTTP 413 rather than accepting a silently truncated prefix.
 
 ### 1.1 Configuration management
 
 | Method/Path | Description |
 |-----------|------|
 | `GET /api/config` | Returns the raw current config.yaml contents (`text/plain`), displayed directly by the UI editor |
-| `PUT /api/config` | Body = full YAML text. Flow: parse → validate (syntax/port conflicts/fields) → atomic write to disk → hot reload. On validation failure, returns 400 with itemized errors, **nothing is written to disk** |
-| `GET /api/devices` | Structured device list + runtime status: `{name, uuid, soap_port, rtsp_port, running, auth_user, endpoints:{device_service, snapshot, streams:[{name, profile_token, rtsp_uri, rtsp, width, height, framerate, bitrate}]}}` (the `streams` array corresponds one-to-one with the configured multi-profile streams). `rtsp_port`/`auth_user` and each stream's `rtsp` (the upstream source URL, may contain credentials), `width/height/framerate/bitrate` are extra fields added to **pre-fill the edit form**: the exposure policy for source URL credentials matches `GET /api/config` (returns the full text verbatim) — both are gated by web Basic auth; the ONVIF password is **not** sent down (see the password-retention semantics of PUT below) |
-| `POST /api/devices` | Body is a JSON DeviceSpec `{name, soap_port, rtsp_port, auth?, streams:[{name,rtsp,width,height,framerate,bitrate}], snapshot?}`. Merged into the current YAML → validate → write to disk → hot reload; uuid/mac/serial are generated at load time. On validation failure (including port conflicts) returns 400; on success `{"status":"applied"}` |
-| `PUT /api/devices/{uuid}` | Body is the same DeviceSpec as POST. Locates the device by uuid (unknown → 404) → builds a new Device from the form values, **replacing it in place**, but **retains the original uuid/mac/serial and info** (the form does not carry these) → validate → write to disk → hot reload. On success `{"status":"applied"}`, validation/port-conflict errors pass through as 400. **ONVIF password retention semantics**: since the DTO only exposes `auth_user` and never the password, if the body carries `auth.username` but `auth.password` is empty, this is treated as "keep the existing password unchanged"; clearing the username (omitting the `auth` object) removes ONVIF authentication |
+| `PUT /api/config` | Body = full YAML text. Flow: parse → validate (syntax/port conflicts/fields) → transactionally switch the runtime → atomic write. Candidate SOAP/RTSP ports are synchronously bound; a bind/write failure restores the previous runtime and leaves the old file intact. On validation failure, returns 400 with itemized errors. Changes to `web.enabled`/`web.port` are rejected as restart-required; Web credentials reload live |
+| `GET /api/devices` | Structured device list + runtime status: `{name, uuid, soap_port, rtsp_port, running, error?, auth_user, endpoints:{device_service, snapshot, streams:[{name, profile_token, rtsp_uri, rtsp, codec, width, height, framerate, bitrate, proxy_port, has_credentials}]}}`. The upstream `rtsp` URL is returned **without userinfo**; `has_credentials` reports whether credentials are stored. Other stream fields pre-fill the edit form. `GET /api/config` remains the explicit authenticated surface that returns the full YAML |
+| `POST /api/devices` | Body is a JSON DeviceSpec `{name, soap_port, rtsp_port, auth?, streams:[{name,rtsp,codec,width,height,framerate,bitrate,proxy_port?}], snapshot?}`. Merged into the current YAML and applied through the same transactional flow as `PUT /api/config`; uuid/mac/serial are generated during preparation. On validation failure (including port conflicts) returns 400; on success `{"status":"applied"}` |
+| `PUT /api/devices/{uuid}` | Body is the same DeviceSpec as POST. Locates the device by uuid (unknown → 404) → builds a new Device from the form values, **replacing it in place**, but **retains the original uuid/mac/serial and info** (the form does not carry these) → validate → write to disk → hot reload. On success `{"status":"applied"}`, validation/port-conflict errors pass through as 400. **Credential retention semantics**: an empty ONVIF password with a retained username keeps the old ONVIF password; an RTSP URL without userinfo keeps stored userinfo from the stream with the same unique name. Explicit new RTSP userinfo replaces it |
 | `DELETE /api/devices/{uuid}` | Deletes the device by uuid from the current config → validate → write to disk → hot reload. Unknown uuid returns 404, success `{"status":"applied"}` |
 
 ### 1.2 Test tools (corresponding to the UI test panel)
@@ -24,7 +24,7 @@ General conventions: JSON responses; error format `{"error": "...", "detail": ".
 | Method/Path | Description |
 |-----------|------|
 | `POST /api/test/rtsp` | Body `{"url": "rtsp://..."}`. Native RTSP probe (OPTIONS + DESCRIBE + Digest/Basic auth), returns: `{"ok":true, "status":200, "auth":"digest", "server":"...", "tracks":[{"type":"video","codec":"H264","fmtp":"..."}], "latency_ms": 43}`. Error categories: `dial_timeout` / `auth_failed` / `not_found` / `no_video_track` / `protocol_error` |
-| `POST /api/test/streaminfo` | Body `{"url": "rtsp://..."}`. Probes the first video stream via ffprobe, returns `{"codec":"h264","width":1920,"height":1080,"fps":25,"bitrate":2048}`, used to pre-fill the add-device form. `bitrate` (kbps): if the source declares it, that value is used; otherwise ffmpeg pulls the stream for 3 seconds and measures the actual byte rate; if it cannot be measured, 0 (the form keeps the manually entered value). Returns 501 if ffmpeg is unavailable |
+| `POST /api/test/streaminfo` | Body `{"url": "rtsp://..."}`. Probes the first video stream via ffprobe, returns `{"codec":"h264","width":1920,"height":1080,"fps":25,"bitrate":2048}`, used to pre-fill the add-device form. `bitrate` (kbps): if the source declares it, that value is used; otherwise ffmpeg pulls the stream for 3 seconds and measures the actual byte rate; if it cannot be measured, 0 (the form keeps the manually entered value). Returns 501 if ffprobe is unavailable |
 | `GET /api/test/snapshot?device=<uuid>&stream=<name>` | Calls ffmpeg to grab one frame from the specified stream (`stream` omitted → main stream), returns `image/jpeg`. On failure returns a JSON error (including an ffmpeg stderr summary) |
 | `GET /api/preview?device=<uuid>&stream=<name>` | **MJPEG live preview**: ffmpeg pulls the specified stream → `-f mpjpeg` (scaled to 640 wide, 5fps, muted) → pushed to the browser as `multipart/x-mixed-replace`, played directly by an `<img>`. Disconnecting the client immediately kills ffmpeg; each device has a cap of 2 concurrent previews |
 | `POST /api/test/onvif?device=<uuid>` | **ONVIF self-check**: the server acts as an ONVIF client calling its own SOAP endpoint, returning `{method, http_status, soap_fault, pass}` per method. Covered methods: GetSystemDateAndTime, GetCapabilities, GetServices, GetScopes, GetNetworkInterfaces, GetDeviceInformation, GetProfiles, GetStreamUri, GetSnapshotUri, plus one deliberately nonexistent method (to verify Fault compliance) |
@@ -73,7 +73,7 @@ Each device is a card:
 
 - Full-text YAML editor (textarea + monospace font, no frontend dependency introduced);
 - "Validate" button: dry-run call to `PUT /api/config?dry_run=1`, reports errors only, nothing is written;
-- "Save & Apply" button: writes to disk + hot reload, shows the reload result;
+- "Save & Apply" button: transactionally switches the runtime and atomically persists it, showing any validation/bind/rollback result;
 - Top notice bar: config file path, last save time.
 
 ### 2.3 Add Device wizard (form)

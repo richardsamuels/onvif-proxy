@@ -8,7 +8,7 @@ Multi-stage build; the final image = `alpine` + ffmpeg + a single binary, target
 
 ```dockerfile
 # ---- build ----
-FROM golang:1.26-alpine AS build
+FROM golang:1.26.5-alpine AS build
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -19,14 +19,23 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}"
 
 # ---- runtime ----
 FROM alpine:3.20
-RUN apk add --no-cache ffmpeg tzdata ca-certificates
+ARG UID=10001
+ARG GID=10001
+RUN apk add --no-cache ffmpeg tzdata ca-certificates \
+    && addgroup -S -g "${GID}" onvif-proxy \
+    && adduser -S -D -H -u "${UID}" -G onvif-proxy onvif-proxy \
+    && mkdir -p /config \
+    && chown onvif-proxy:onvif-proxy /config
 COPY --from=build /out/onvif-proxy /usr/local/bin/onvif-proxy
 VOLUME /config
 EXPOSE 8080
+USER onvif-proxy:onvif-proxy
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["sh", "-ec", "kill -0 1"]
 ENTRYPOINT ["onvif-proxy", "-config", "/config/config.yaml"]
 ```
 
-Multi-arch: `linux/amd64` + `linux/arm64` (Raspberry Pi / NAS), built with `docker buildx` + GitHub Actions and published to GHCR.
+Multi-arch: `linux/amd64` + `linux/arm64` (Raspberry Pi / NAS), built with `docker buildx` + GitHub Actions and published to GHCR. The builder and CI use the patched Go 1.26.5 toolchain. The application runs as the fixed non-root user `10001:10001`. The health check tests the PID 1 process rather than `/healthz`, so it still works when the Web UI is disabled or protected by Basic auth. It is a liveness check, not a readiness check for every configured ONVIF/RTSP listener.
 
 ### Environment variables
 
@@ -52,7 +61,7 @@ services:
       lan:
         ipv4_address: 192.168.1.99      # must match advertise_ip in config.yaml
     volumes:
-      - ./config:/config
+      - onvif-config:/config
 
 networks:
   lan:
@@ -64,6 +73,9 @@ networks:
         - subnet: 192.168.1.0/24
           gateway: 192.168.1.1
           ip_range: 192.168.1.96/28      # small range reserved for the container
+
+volumes:
+  onvif-config:
 ```
 
 Note: under macvlan, **the host itself cannot reach the container's IP by default** (a kernel limitation); access the management UI from another machine on the LAN, or add a macvlan shim interface.
@@ -77,10 +89,13 @@ services:
     network_mode: host
     restart: unless-stopped
     volumes:
-      - ./config:/config
+      - onvif-config:/config
     environment:                         # optional: env overrides for global config (see docs/03 §3)
       ONVIF_WEB_USERNAME: admin
       ONVIF_WEB_PASSWORD: ${WEB_PASSWORD}
+
+volumes:
+  onvif-config:
 ```
 
 Multicast works; all ports are bound directly on the host, so plan around this to avoid conflicts. The same spot in compose.yaml also keeps a commented-out `ONVIF_WEB_PORT` override example (for changing the Web UI listen port) — uncomment it as needed, with no changes to config.yaml required.
@@ -96,16 +111,28 @@ Map ports one by one (8080, plus each device's soap/rtsp ports), set `advertise_
 
 ## 4. Upgrades and data
 
-- The only persisted data is `/config/config.yaml` (including the auto-generated uuid/mac);
+- The only persisted data is `/config/config.yaml` (including the auto-generated uuid/mac). The default `onvif-config` named volume inherits the image's non-root ownership, so an empty volume supports first-run config generation without any permission setup;
 - Upgrading = swap the image and restart; persisting the uuid/mac ensures the client never mistakes the device for a new one;
-- Backup = back up that single YAML file.
+- Backup = back up that single YAML file. For example: `docker cp onvif-proxy:/config/config.yaml ./config.yaml`;
+- If you prefer a host bind mount for direct editing, run the container as your host UID/GID so atomic config rewrites remain writable:
+
+  ```bash
+  mkdir -p config
+  docker run -d --name onvif-proxy --network host \
+    --user "$(id -u):$(id -g)" \
+    -v "$(pwd)/config:/config" \
+    ghcr.io/aiaid/onvif-proxy:latest
+  ```
+
+  Alternatively, keep the image's default user and make the bind directory writable by UID/GID `10001:10001`. Do not make the directory world-writable; it may contain upstream camera credentials.
 
 ## 5. CI/CD (GitHub Actions, already implemented: `.github/workflows/docker-publish.yml`)
 
-- **PR** → `go vet` + `go test -race` (test only, no build);
+- **PR** → UI type/build checks + stale-bundle check + `go vet` + `go test -race` + `govulncheck` (test only, no image publish);
 - **push to main / tag v\* / manual trigger** → test → amd64 + arm64 built in parallel on **native runners** (push-by-digest to GHCR, with gha cache) → a merge job combines the manifest list;
 - Image target: `ghcr.io/aiaid/onvif-proxy` (via `GITHUB_TOKEN`, always available); when the repository has `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets configured, the same set of tags is automatically mirrored to Docker Hub `<user>/onvif-proxy` (imagetools copies the blobs cross-registry, no rebuild needed);
-- Tag rules: branch name, `v*` versions (+ semver), short sha, and `latest` on main; the `VERSION` build-arg is injected into the binary (tag name or short sha).
+- Tag rules: branch name, `v*` versions (+ semver), short sha, and `latest` on main; the `VERSION` build-arg is injected into the binary (tag name or short sha);
+- Workflow permissions default to read-only repository access, publishing jobs alone receive `packages: write`, and third-party actions are pinned to verified commit SHAs.
 
 ## 6. Running bare-metal (without Docker)
 

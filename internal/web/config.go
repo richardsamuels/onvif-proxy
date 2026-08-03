@@ -1,9 +1,6 @@
 package web
 
-import (
-	"io"
-	"net/http"
-)
+import "net/http"
 
 // handleGetConfig returns the raw config.yaml text for the editor.
 func (s *Server) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
@@ -20,9 +17,12 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 // Validation failures return 400 with the full error text so the UI can show
 // each problem verbatim.
 func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+
+	body, err := readRequestBody(r, maxConfigBodyBytes)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "read body failed", err.Error())
+		writeBodyError(w, "read body failed", err)
 		return
 	}
 	dryRun := r.URL.Query().Get("dry_run") == "1"

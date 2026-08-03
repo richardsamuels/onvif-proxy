@@ -12,10 +12,12 @@ An **RTSP → ONVIF virtual camera proxy** written in Go. It wraps any existing 
 
 - **Full ONVIF Profile S mandatory coverage** — every mandatory Device and Media service method is implemented; unimplemented optional methods return a spec-compliant `ter:ActionNotSupported` SOAP fault instead of a bare 500.
 - **Multiple media profiles per device** — not just a high/low pair: define any number of named streams (`main` / `sub` / `mobile` / …), each exposed as its own ONVIF profile with its own encoder configuration and stream URI.
+- **Honest codec metadata** — each profile declares its configured H.264, JPEG/MJPEG, or MPEG-4 encoder consistently across profiles, options, and guaranteed-instance counts. H.265/HEVC is rejected because ONVIF Profile S does not define an H.265 encoder type.
 - **Snapshot support** — `GetSnapshotUri` works out of the box: pass through the real camera's HTTP snapshot URL when it has one, or let the built-in ffmpeg grabber pull a JPEG frame straight from the RTSP stream (with short-TTL caching). This fills a gap left open by the upstream projects.
 - **WS-Discovery** — multicast discovery on UDP 3702 with Hello / Bye / ProbeMatches, so clients find the virtual devices automatically.
 - **Zero-transcode RTSP proxy** — a per-device TCP passthrough proxy forwards the stream bytes untouched to the real camera; no decoding, no CPU cost. ffmpeg is only used for snapshots and UI previews.
 - **Web UI** — besides the YAML config file, a small embedded web backend lets you edit the config online, probe RTSP connectivity (native RTSP client with Digest/Basic auth and SDP parsing), grab snapshots, watch a live MJPEG preview, and run an ONVIF self-test against the virtual device itself.
+- **Transactional hot reload** — configuration changes validate and reserve their listeners before being committed; bind or persistence failures restore the previous runtime and leave the old config file intact.
 - **Docker-first deployment** — multi-stage build with ffmpeg baked in; macvlan compose example so each virtual device can get its own IP/MAC on your LAN.
 - **Single binary, minimal dependencies** — `gopkg.in/yaml.v3` plus the official MCP `go-sdk`; SOAP messages are hand-written XML templates, no WSDL code generation.
 - **MCP server built in** — `/mcp` (Streamable HTTP) exposes device management, RTSP probing, snapshots and the ONVIF self-test as MCP tools for AI clients such as Claude Code (see [docs/07-mcp.md](docs/07-mcp.md)).
@@ -31,6 +33,7 @@ Design docs (bilingual — each has a `.zh-CN.md` counterpart, e.g. [docs/01-arc
 | [docs/03-config.md](docs/03-config.md) | YAML config format and validation rules |
 | [docs/04-web-api.md](docs/04-web-api.md) | Web backend REST API and UI design |
 | [docs/05-deployment.md](docs/05-deployment.md) | Docker / macvlan deployment |
+| [docs/06-internal-api.md](docs/06-internal-api.md) | Exported package interfaces and integration contracts |
 | [docs/07-mcp.md](docs/07-mcp.md) | Built-in MCP server endpoint (`/mcp`), tool catalog, implementation contract |
 
 ## Quick start (Docker)
@@ -47,14 +50,16 @@ Tags: `latest` (main), `main`, `sha-<short>`, and `vX.Y.Z` on release tags.
 ```bash
 # Linux host networking (simplest; multicast discovery works)
 docker run -d --name onvif-proxy --network host \
-  -v "$(pwd)/config:/config" \
+  -v onvif-proxy-config:/config \
   ghcr.io/aiaid/onvif-proxy:latest
 
 # Open the web UI and add devices through the form
 open http://<host>:8080
 ```
 
-No config file needed for the first run — a default one is generated under `./config/config.yaml`, and devices can be added entirely through the web UI ("➕ 新增设备" form probes your RTSP URL and autofills resolution/fps). For macvlan (own IP/MAC per proxy, best Unifi Protect experience) or bridge mode (Docker Desktop), see [docs/05-deployment.md](docs/05-deployment.md) and [compose.yaml](compose.yaml).
+No config file is needed for the first run — a default one is generated in the `onvif-proxy-config` volume, and devices can be added entirely through the web UI ("➕ 新增设备" form probes your RTSP URL and autofills resolution/fps). The image runs as the non-root user `10001:10001`; the named volume works without host permission changes. For a host bind mount, backups, macvlan (own IP/MAC per proxy), or bridge mode (Docker Desktop), see [docs/05-deployment.md](docs/05-deployment.md) and [compose.yaml](compose.yaml).
+
+The default Web UI/MCP listener has no password. Keep it on a trusted network or set `ONVIF_WEB_USERNAME` and `ONVIF_WEB_PASSWORD` before exposing the host. Camera credentials remain visible through the authenticated full-config editor by design.
 
 Global settings can also be overridden via environment variables (`-e ONVIF_WEB_USERNAME=admin -e ONVIF_WEB_PASSWORD=…` for web UI Basic auth, plus `ONVIF_ADVERTISE_IP`, `ONVIF_DISCOVERY`, `ONVIF_WEB_ENABLED`, `ONVIF_WEB_PORT`). Env beats YAML, applies in memory only, and is never written back to the mounted config file — see [docs/03-config.md](docs/03-config.md) §3.
 
@@ -69,12 +74,15 @@ services:
     network_mode: host          # or macvlan / bridge, see docs/05-deployment.md
     restart: unless-stopped
     volumes:
-      - ./config:/config
+      - onvif-config:/config
     environment:
       ONVIF_WEB_USERNAME: admin
       ONVIF_WEB_PASSWORD: change-me
       ONVIF_ADVERTISE_IP: "192.168.1.10"   # required in bridge mode
       ONVIF_WEB_PORT: "9090"
+
+volumes:
+  onvif-config:
 ```
 
 ### config.yaml example
@@ -98,6 +106,7 @@ devices:
     streams:
       - name: main
         rtsp: "rtsp://user:pass@192.168.1.50:554/h264/ch1/main/av_stream"
+        codec: h264
         width: 1920
         height: 1080
         framerate: 25
@@ -113,13 +122,14 @@ There are **two independent credential layers** — a frequent point of confusio
 | Layer | Where it lives | Verified by | Purpose |
 |-------|----------------|-------------|---------|
 | RTSP credentials | `user:pass@` inside `streams[].rtsp` | the **real camera** | pulling the stream |
-| ONVIF credentials | `devices[].auth` (optional) | **onvif-proxy** (WSSE) | protecting the virtual device's SOAP API |
+| ONVIF credentials | `devices[].auth` (optional) | **onvif-proxy** (WSSE + HTTP Basic) | protecting SOAP and the snapshot HTTP endpoint |
 
 Key behavior:
 
 - The RTSP proxy is a plain TCP passthrough: **RTSP auth is end-to-end**. `GetStreamUri` never exposes credentials; the ONVIF client must authenticate against the real camera with the **camera's own RTSP credentials**.
 - The `user:pass@` in the config is only used by onvif-proxy itself (snapshots, previews, probing) and is never handed to ONVIF clients.
-- Omitting `devices[].auth` means the ONVIF endpoints accept any client (recommended for trusted LANs).
+- When `devices[].auth` is configured, SOAP uses WSSE and the snapshot URL uses the same pair through HTTP Basic. Basic auth does not encrypt transport, so use a trusted LAN or TLS termination.
+- Omitting `devices[].auth` means the ONVIF and snapshot endpoints accept any client (recommended only for trusted LANs).
 
 **Unifi Protect tip:** Protect asks for a single username/password during adoption and uses it for *both* layers. Enter the real camera's RTSP credentials there, and either leave `devices[].auth` unset or set it to the exact same pair — never a different one.
 
@@ -137,4 +147,4 @@ All packages have unit tests; the built-in ONVIF self-test passes end-to-end
 
 ## License
 
-MIT
+[MIT](LICENSE)

@@ -6,6 +6,7 @@ package discovery
 
 import (
 	"context"
+	"errors"
 	"math/rand"
 	"net"
 	"sync"
@@ -31,8 +32,13 @@ type LogEntry struct {
 	Detail string
 }
 
-// logCap is the size of the in-memory ring buffer surfaced by Log.
-const logCap = 50
+const (
+	// logCap is the size of the in-memory ring buffer surfaced by Log.
+	logCap = 50
+
+	probeWorkers   = 16
+	probeQueueSize = 64
+)
 
 // Server is the WS-Discovery responder. It is safe for concurrent use.
 type Server struct {
@@ -53,15 +59,34 @@ func New(devices []Device) *Server {
 // serves Probe requests until ctx is cancelled, at which point it sends a Bye
 // for every current device and returns ctx.Err().
 func (s *Server) Run(ctx context.Context) error {
-	addr, err := net.ResolveUDPAddr("udp4", multicastAddr)
+	conn, addr, err := Listen()
 	if err != nil {
 		return err
+	}
+	return s.Serve(ctx, conn, addr)
+}
+
+// Listen binds and joins the ONVIF WS-Discovery multicast group. Callers may
+// use it before replacing a running configuration so bind failures are known
+// synchronously.
+func Listen() (*net.UDPConn, *net.UDPAddr, error) {
+	addr, err := net.ResolveUDPAddr("udp4", multicastAddr)
+	if err != nil {
+		return nil, nil, err
 	}
 	conn, err := net.ListenMulticastUDP("udp4", nil, addr)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
+	return conn, addr, nil
+}
 
+// Serve runs discovery on a socket returned by Listen. Serve owns conn and
+// closes it on shutdown.
+func (s *Server) Serve(ctx context.Context, conn *net.UDPConn, addr *net.UDPAddr) error {
+	if conn == nil || addr == nil {
+		return errors.New("discovery: nil UDP connection or multicast address")
+	}
 	s.mu.Lock()
 	s.conn = conn
 	s.multicast = addr
@@ -74,53 +99,49 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}
 
-	done := make(chan struct{})
-	go s.readLoop(conn, addr, done)
+	done := make(chan error, 1)
+	go func() { done <- s.readLoop(conn) }()
 
-	<-ctx.Done()
-
-	// Announce departure for whatever set is current at shutdown.
-	s.mu.Lock()
-	byeDevs := append([]Device(nil), s.devices...)
-	s.conn = nil
-	s.multicast = nil
-	s.mu.Unlock()
-	for _, d := range byeDevs {
-		if _, err := conn.WriteToUDP(buildBye(d), addr); err == nil {
-			s.addLog("", "bye", d.UUID)
+	select {
+	case <-ctx.Done():
+		// Announce departure for whatever set is current at shutdown.
+		s.mu.Lock()
+		byeDevs := append([]Device(nil), s.devices...)
+		if s.conn == conn {
+			s.conn = nil
+			s.multicast = nil
 		}
+		s.mu.Unlock()
+		for _, d := range byeDevs {
+			if _, err := conn.WriteToUDP(buildBye(d), addr); err == nil {
+				s.addLog("", "bye", d.UUID)
+			}
+		}
+		_ = conn.Close()
+		<-done
+		return ctx.Err()
+	case err := <-done:
+		s.mu.Lock()
+		if s.conn == conn {
+			s.conn = nil
+			s.multicast = nil
+		}
+		s.mu.Unlock()
+		_ = conn.Close()
+		if err == nil {
+			return errors.New("discovery: UDP read loop stopped")
+		}
+		return err
 	}
-
-	conn.Close()
-	<-done
-	return ctx.Err()
 }
 
-// SetDevices hot-reloads the device set. Devices are diffed by UUID: removed
-// ones get a Bye, newly added ones get a Hello (only while Run is active).
+// SetDevices hot-reloads the device set. Removed devices get a Bye and added
+// devices get a Hello. A metadata change for an existing UUID is announced as
+// Bye(old) followed by Hello(new), so clients do not retain stale XAddrs or
+// scopes.
 func (s *Server) SetDevices(devices []Device) {
 	s.mu.Lock()
-	oldByUUID := make(map[string]bool, len(s.devices))
-	for _, d := range s.devices {
-		oldByUUID[d.UUID] = true
-	}
-	newByUUID := make(map[string]bool, len(devices))
-	for _, d := range devices {
-		newByUUID[d.UUID] = true
-	}
-
-	var removed, added []Device
-	for _, d := range s.devices {
-		if !newByUUID[d.UUID] {
-			removed = append(removed, d)
-		}
-	}
-	for _, d := range devices {
-		if !oldByUUID[d.UUID] {
-			added = append(added, d)
-		}
-	}
-
+	removed, added := diffDevices(s.devices, devices)
 	s.devices = append([]Device(nil), devices...)
 	conn, addr := s.conn, s.multicast
 	s.mu.Unlock()
@@ -141,6 +162,30 @@ func (s *Server) SetDevices(devices []Device) {
 	}
 }
 
+func diffDevices(old, current []Device) (removed, added []Device) {
+	oldByUUID := make(map[string]Device, len(old))
+	for _, d := range old {
+		oldByUUID[d.UUID] = d
+	}
+	newByUUID := make(map[string]Device, len(current))
+	for _, d := range current {
+		newByUUID[d.UUID] = d
+	}
+	for _, d := range old {
+		next, exists := newByUUID[d.UUID]
+		if !exists || next != d {
+			removed = append(removed, d)
+		}
+	}
+	for _, d := range current {
+		previous, exists := oldByUUID[d.UUID]
+		if !exists || previous != d {
+			added = append(added, d)
+		}
+	}
+	return removed, added
+}
+
 // Log returns up to the last logCap events, newest first.
 func (s *Server) Log() []LogEntry {
 	s.mu.Lock()
@@ -150,19 +195,45 @@ func (s *Server) Log() []LogEntry {
 	return out
 }
 
-// readLoop receives datagrams until the socket is closed, handling each Probe
-// on its own goroutine (a ProbeMatch is delayed up to APP_MAX_DELAY).
-func (s *Server) readLoop(conn *net.UDPConn, _ *net.UDPAddr, done chan struct{}) {
-	defer close(done)
+type probeJob struct {
+	data []byte
+	src  *net.UDPAddr
+}
+
+// readLoop receives datagrams until the socket is closed. A fixed worker pool
+// and bounded queue prevent a UDP flood from creating unbounded goroutines.
+func (s *Server) readLoop(conn *net.UDPConn) error {
+	jobs := make(chan probeJob, probeQueueSize)
+	var workers sync.WaitGroup
+	workers.Add(probeWorkers)
+	for range probeWorkers {
+		go func() {
+			defer workers.Done()
+			for job := range jobs {
+				s.handleProbe(conn, job.data, job.src)
+			}
+		}()
+	}
+
 	buf := make([]byte, 65535)
 	for {
 		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			return // socket closed on shutdown
+			close(jobs)
+			workers.Wait()
+			return err
+		}
+		if len(jobs) == cap(jobs) {
+			continue
 		}
 		data := make([]byte, n)
 		copy(data, buf[:n])
-		go s.handleProbe(conn, data, src)
+		select {
+		case jobs <- probeJob{data: data, src: src}:
+		default:
+			// Saturated: drop this datagram. UDP discovery is retryable, and
+			// bounded memory is preferable to queue growth under a flood.
+		}
 	}
 }
 

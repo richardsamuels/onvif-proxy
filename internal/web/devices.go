@@ -4,27 +4,28 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
+	"net/url"
 
 	"github.com/Aiaid/onvif-proxy/internal/config"
 	"gopkg.in/yaml.v3"
 )
 
-// streamView is one Profile exposed by a device. Alongside the proxied
-// endpoint (rtsp_uri) it carries the raw source parameters so the edit form can
-// prefill without re-probing the camera. Exposing the upstream URL (with any
-// embedded credentials) is consistent with GET /api/config, which already
-// returns the configuration verbatim; web Basic auth gates both.
+// streamView is one Profile exposed by a device. Alongside the proxied endpoint
+// it carries source parameters for edit-form prefill. RTSP userinfo is stripped
+// from this list DTO and retained server-side when an edit leaves it absent.
 type streamView struct {
-	Name         string `json:"name"`
-	ProfileToken string `json:"profile_token"`
-	RTSPURI      string `json:"rtsp_uri"`
-	RTSP         string `json:"rtsp"`
-	Width        int    `json:"width"`
-	Height       int    `json:"height"`
-	Framerate    int    `json:"framerate"`
-	Bitrate      int    `json:"bitrate"`
+	Name           string `json:"name"`
+	ProfileToken   string `json:"profile_token"`
+	RTSPURI        string `json:"rtsp_uri"`
+	RTSP           string `json:"rtsp"`
+	Codec          string `json:"codec"`
+	Width          int    `json:"width"`
+	Height         int    `json:"height"`
+	Framerate      int    `json:"framerate"`
+	Bitrate        int    `json:"bitrate"`
+	ProxyPort      int    `json:"proxy_port"`
+	HasCredentials bool   `json:"has_credentials"`
 }
 
 type endpointsView struct {
@@ -39,6 +40,7 @@ type deviceView struct {
 	SOAPPort  int           `json:"soap_port"`
 	RTSPPort  int           `json:"rtsp_port"`
 	Running   bool          `json:"running"`
+	Error     string        `json:"error,omitempty"`
 	AuthUser  string        `json:"auth_user"` // ONVIF WSSE username, "" when auth is off
 	Endpoints endpointsView `json:"endpoints"`
 }
@@ -62,16 +64,20 @@ func (s *Server) deviceViews() []deviceView {
 		}
 		streams := make([]streamView, 0, len(dev.Streams))
 		for _, st := range dev.Streams {
+			safeRTSP, hasCredentials := stripURLCredentials(st.RTSP)
 			streams = append(streams, streamView{
 				Name:         st.Name,
 				ProfileToken: st.ProfileToken(),
 				RTSPURI: fmt.Sprintf("rtsp://%s:%d%s",
 					advertiseIP, dev.ProxyPortFor(st), st.PathQuery()),
-				RTSP:      st.RTSP,
-				Width:     st.Width,
-				Height:    st.Height,
-				Framerate: st.Framerate,
-				Bitrate:   st.Bitrate,
+				RTSP:           safeRTSP,
+				Codec:          st.CodecName(),
+				Width:          st.Width,
+				Height:         st.Height,
+				Framerate:      st.Framerate,
+				Bitrate:        st.Bitrate,
+				ProxyPort:      st.ProxyPort,
+				HasCredentials: hasCredentials,
 			})
 		}
 		snapToken := ""
@@ -88,6 +94,7 @@ func (s *Server) deviceViews() []deviceView {
 			SOAPPort: dev.Ports.SOAP,
 			RTSPPort: dev.Ports.RTSP,
 			Running:  dr.Running,
+			Error:    dr.Error,
 			AuthUser: authUser,
 			Endpoints: endpointsView{
 				DeviceService: fmt.Sprintf("http://%s:%d/onvif/device_service",
@@ -121,10 +128,12 @@ type addDeviceRequest struct {
 	Streams []struct {
 		Name      string `json:"name"`
 		RTSP      string `json:"rtsp"`
+		Codec     string `json:"codec,omitempty"`
 		Width     int    `json:"width,omitempty"`
 		Height    int    `json:"height,omitempty"`
 		Framerate int    `json:"framerate,omitempty"`
 		Bitrate   int    `json:"bitrate,omitempty"`
+		ProxyPort int    `json:"proxy_port,omitempty"`
 	} `json:"streams"`
 	Snapshot *struct {
 		URL          string `json:"url,omitempty"`
@@ -139,9 +148,9 @@ type addDeviceRequest struct {
 // and port-conflict validation is performed by ApplyConfig's Parse; its errors
 // are returned verbatim as 400 so the form can display them.
 func (s *Server) handleAddDevice(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := readRequestBody(r, maxDeviceBodyBytes)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "read body failed", err.Error())
+		writeBodyError(w, "read body failed", err)
 		return
 	}
 	var req addDeviceRequest
@@ -149,6 +158,9 @@ func (s *Server) handleAddDevice(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body", err.Error())
 		return
 	}
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 
 	cfg, err := s.currentConfig()
 	if err != nil {
@@ -177,10 +189,12 @@ func buildDevice(req addDeviceRequest) *config.Device {
 		dev.Streams = append(dev.Streams, &config.Stream{
 			Name:      st.Name,
 			RTSP:      st.RTSP,
+			Codec:     st.Codec,
 			Width:     st.Width,
 			Height:    st.Height,
 			Framerate: st.Framerate,
 			Bitrate:   st.Bitrate,
+			ProxyPort: st.ProxyPort,
 		})
 	}
 	if req.Snapshot != nil {
@@ -201,9 +215,9 @@ func buildDevice(req addDeviceRequest) *config.Device {
 func (s *Server) handleEditDevice(w http.ResponseWriter, r *http.Request) {
 	uuid := r.PathValue("uuid")
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := readRequestBody(r, maxDeviceBodyBytes)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "read body failed", err.Error())
+		writeBodyError(w, "read body failed", err)
 		return
 	}
 	var req addDeviceRequest
@@ -211,6 +225,9 @@ func (s *Server) handleEditDevice(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid body", err.Error())
 		return
 	}
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 
 	cfg, err := s.currentConfig()
 	if err != nil {
@@ -236,6 +253,7 @@ func (s *Server) handleEditDevice(w http.ResponseWriter, r *http.Request) {
 	dev.MAC = orig.MAC
 	dev.Serial = orig.Serial
 	dev.Info = orig.Info
+	preserveRTSPCredentials(dev, orig)
 	// The DeviceRuntime DTO exposes only the ONVIF username, never the password,
 	// so the edit form cannot round-trip it. A form that keeps a username but
 	// leaves the password blank therefore means "unchanged", not "clear": carry
@@ -253,6 +271,9 @@ func (s *Server) handleEditDevice(w http.ResponseWriter, r *http.Request) {
 // config and hot-reloads it. Unknown uuid returns 404.
 func (s *Server) handleDeleteDevice(w http.ResponseWriter, r *http.Request) {
 	uuid := r.PathValue("uuid")
+
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 
 	cfg, err := s.currentConfig()
 	if err != nil {
@@ -276,6 +297,53 @@ func (s *Server) handleDeleteDevice(w http.ResponseWriter, r *http.Request) {
 	cfg.Devices = kept
 
 	s.applyConfig(w, cfg)
+}
+
+// stripURLCredentials returns a URL safe for management list responses. The
+// config editor remains the explicit endpoint for viewing the full source URL.
+func stripURLCredentials(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	if u.User == nil {
+		return raw, false
+	}
+	u.User = nil
+	return u.String(), true
+}
+
+// preserveRTSPCredentials implements edit-form retention semantics: GET
+// /api/devices omits upstream userinfo, so an update that leaves userinfo out
+// keeps the stored credentials for the stream with the same unique name.
+// Name-based matching prevents reordering or insertion from assigning one
+// camera's secret to another stream. Supplying new userinfo replaces it.
+func preserveRTSPCredentials(dev, original *config.Device) {
+	originalByName := make(map[string]*config.Stream, len(original.Streams))
+	for _, stream := range original.Streams {
+		if stream != nil {
+			originalByName[stream.Name] = stream
+		}
+	}
+	for _, stream := range dev.Streams {
+		if stream == nil {
+			continue
+		}
+		previousStream := originalByName[stream.Name]
+		if previousStream == nil {
+			continue
+		}
+		current, err := url.Parse(stream.RTSP)
+		if err != nil || current.User != nil {
+			continue
+		}
+		previous, err := url.Parse(previousStream.RTSP)
+		if err != nil || previous.User == nil {
+			continue
+		}
+		current.User = previous.User
+		stream.RTSP = current.String()
+	}
 }
 
 // currentConfig fetches and strictly parses the on-disk YAML. The disk config is

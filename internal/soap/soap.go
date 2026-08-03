@@ -148,22 +148,29 @@ func ExtractElement(inner []byte, localName string) (string, bool) {
 //
 //	Digest = Base64( SHA-1( Base64Decode(Nonce) + Created + Password ) )
 //
-// PasswordText is accepted as a plain-text comparison. When a Created
-// timestamp is present and parseable it must fall within clockSkew of now.
+// PasswordText is accepted as a plain-text comparison. PasswordDigest always
+// requires a non-empty, valid Base64 Nonce and a valid Created timestamp
+// within clockSkew of now. For PasswordText, an optional Created timestamp
+// must also be valid and within the allowed skew.
 func (t *UsernameToken) Verify(username, password string, clockSkew time.Duration) bool {
 	if t == nil || t.Username != username {
 		return false
 	}
 	if t.Created != "" {
-		if created, ok := parseCreated(t.Created); ok {
-			if d := time.Since(created); d > clockSkew || d < -clockSkew {
-				return false
-			}
+		created, ok := parseCreated(t.Created)
+		if !ok {
+			return false
+		}
+		if d := time.Since(created); d > clockSkew || d < -clockSkew {
+			return false
 		}
 	}
-	if isDigest(t.PasswordType) || (t.PasswordType == "" && t.Nonce != "") {
+	if t.IsDigest() {
+		if t.Created == "" || t.Nonce == "" {
+			return false
+		}
 		nonce, err := base64.StdEncoding.DecodeString(t.Nonce)
-		if err != nil {
+		if err != nil || len(nonce) == 0 {
 			return false
 		}
 		h := sha1.New()
@@ -174,6 +181,13 @@ func (t *UsernameToken) Verify(username, password string, clockSkew time.Duratio
 		return subtle.ConstantTimeCompare([]byte(want), []byte(t.Password)) == 1
 	}
 	return subtle.ConstantTimeCompare([]byte(password), []byte(t.Password)) == 1
+}
+
+// IsDigest reports whether this token uses PasswordDigest. Some ONVIF clients
+// omit Password/@Type but include a Nonce; that interoperable form is treated
+// as a digest too.
+func (t *UsernameToken) IsDigest() bool {
+	return t != nil && (isDigest(t.PasswordType) || (t.PasswordType == "" && t.Nonce != ""))
 }
 
 func isDigest(passwordType string) bool {

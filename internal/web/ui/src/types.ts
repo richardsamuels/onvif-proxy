@@ -5,10 +5,13 @@ export interface StreamView {
   profile_token: string;
   rtsp_uri: string;
   rtsp: string;
+  codec: string;
   width: number;
   height: number;
   framerate: number;
   bitrate: number;
+  proxy_port: number;
+  has_credentials: boolean;
 }
 
 export interface DeviceView {
@@ -17,6 +20,7 @@ export interface DeviceView {
   soap_port: number;
   rtsp_port: number;
   running: boolean;
+  error?: string;
   auth_user: string;
   endpoints: {
     device_service: string;
@@ -74,9 +78,11 @@ export interface DeviceSpec {
   streams: Array<{
     name: string;
     rtsp: string;
+    codec: string;
     width: number;
     height: number;
     framerate: number;
     bitrate: number;
+    proxy_port?: number;
   }>;
 }

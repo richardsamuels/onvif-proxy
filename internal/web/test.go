@@ -2,8 +2,6 @@ package web
 
 import (
 	"context"
-	"encoding/json"
-	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -18,8 +16,8 @@ func (s *Server) handleTestRTSP(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		URL string `json:"url"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body", err.Error())
+	if err := decodeJSONBody(r, maxProbeBodyBytes, &req); err != nil {
+		writeBodyError(w, "invalid body", err)
 		return
 	}
 	u, err := url.Parse(req.URL)
@@ -74,16 +72,16 @@ func toRTSPView(res *rtsp.Result) rtspView {
 // form to auto-fill width/height/framerate. Only the RTSP scheme is accepted.
 // When ffmpeg (and thus ffprobe) is unavailable it returns 501.
 func (s *Server) handleTestStreamInfo(w http.ResponseWriter, r *http.Request) {
-	if !mediautil.Available() {
-		writeErr(w, http.StatusNotImplemented, "ffmpeg unavailable",
-			"ffprobe is required for stream probing but is not on PATH")
-		return
-	}
 	var req struct {
 		URL string `json:"url"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body", err.Error())
+	if err := decodeJSONBody(r, maxProbeBodyBytes, &req); err != nil {
+		writeBodyError(w, "invalid body", err)
+		return
+	}
+	if !mediautil.ProbeAvailable() {
+		writeErr(w, http.StatusNotImplemented, "ffmpeg unavailable",
+			"ffprobe is required for stream probing but is not on PATH")
 		return
 	}
 	u, err := url.Parse(req.URL)

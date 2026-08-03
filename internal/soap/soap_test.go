@@ -114,6 +114,27 @@ func TestVerifyPasswordDigest(t *testing.T) {
 	if old.Verify(user, pass, 5*time.Minute) {
 		t.Error("stale Created accepted")
 	}
+
+	missingCreated := *tok
+	missingCreated.Created = ""
+	if missingCreated.Verify(user, pass, 5*time.Minute) {
+		t.Error("digest without Created accepted")
+	}
+	badCreated := *tok
+	badCreated.Created = "not-a-timestamp"
+	if badCreated.Verify(user, pass, 5*time.Minute) {
+		t.Error("digest with invalid Created accepted")
+	}
+	missingNonce := *tok
+	missingNonce.Nonce = ""
+	if missingNonce.Verify(user, pass, 5*time.Minute) {
+		t.Error("digest without Nonce accepted")
+	}
+	badNonce := *tok
+	badNonce.Nonce = "not-base64!"
+	if badNonce.Verify(user, pass, 5*time.Minute) {
+		t.Error("digest with invalid Nonce accepted")
+	}
 }
 
 func TestVerifyPasswordText(t *testing.T) {
@@ -127,6 +148,10 @@ func TestVerifyPasswordText(t *testing.T) {
 	}
 	if tok.Verify("admin", "nope", 5*time.Minute) {
 		t.Error("wrong text password accepted")
+	}
+	tok.Created = "not-a-timestamp"
+	if tok.Verify("admin", "secret", 5*time.Minute) {
+		t.Error("text password with invalid Created accepted")
 	}
 }
 

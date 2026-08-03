@@ -6,17 +6,17 @@ Web 服务默认监听 `:8080`,提供 REST API 与内嵌单页 UI。可选 HTTP 
 
 ## 1. REST API
 
-统一约定:JSON 响应;错误格式 `{"error": "...", "detail": "..."}`;写操作仅 `PUT/POST`。
+统一约定:JSON 响应;错误格式 `{"error": "...", "detail": "..."}`;写操作仅 `PUT/POST`。配置/设备请求体超过 1 MiB、探测 JSON 超过 64 KiB 时返回 HTTP 413,不会再接受被静默截断的前缀。
 
 ### 1.1 配置管理
 
 | 方法/路径 | 说明 |
 |-----------|------|
 | `GET /api/config` | 返回当前 config.yaml 原文(`text/plain`),UI 编辑器直接展示 |
-| `PUT /api/config` | Body = 完整 YAML 文本。流程:解析 → 校验(语法/端口冲突/字段)→ 原子落盘 → 热重载。校验失败返回 400 + 逐条错误,**不落盘** |
-| `GET /api/devices` | 结构化设备列表 + 运行时状态:`{name, uuid, soap_port, rtsp_port, running, auth_user, endpoints:{device_service, snapshot, streams:[{name, profile_token, rtsp_uri, rtsp, width, height, framerate, bitrate}]}}`(streams 数组与配置的多 Profile 一一对应)。`rtsp_port`/`auth_user` 与每个 stream 的 `rtsp`(上游源 URL,可能含凭证)、`width/height/framerate/bitrate` 是为**编辑表单预填**而补充的字段:源 URL 凭证的暴露口径与 `GET /api/config`(原样返回全文)一致,均由 web Basic 认证把关;ONVIF 密码**不**下发(见下方 PUT 的密码保留语义) |
-| `POST /api/devices` | Body JSON DeviceSpec `{name, soap_port, rtsp_port, auth?, streams:[{name,rtsp,width,height,framerate,bitrate}], snapshot?}`。合入当前 YAML → 校验 → 落盘 → 热重载;uuid/mac/serial 交由加载时生成。校验失败(含端口冲突)返回 400,成功 `{"status":"applied"}` |
-| `PUT /api/devices/{uuid}` | Body 与 POST 相同的 DeviceSpec。按 uuid 定位设备(未知 404)→ 用表单值构建新 Device,**原位替换**,但**保留原 uuid/mac/serial 与 info**(表单不携带这些)→ 校验 → 落盘 → 热重载。成功 `{"status":"applied"}`,校验/端口冲突 400 透传。**ONVIF 密码保留语义**:DTO 只暴露 `auth_user` 不暴露密码,故当 body 携带 `auth.username` 但 `auth.password` 为空时视为"保持原密码不变";清空 username(不带 auth 对象)则移除 ONVIF 认证 |
+| `PUT /api/config` | Body = 完整 YAML 文本。流程:解析 → 校验(语法/端口冲突/字段)→ 事务式切换运行态 → 原子落盘。候选 SOAP/RTSP 端口会同步绑定;绑定或写入失败会恢复旧运行态并保持旧文件不变。校验失败返回 400 + 逐条错误。`web.enabled`/`web.port` 变更会以“需重启”拒绝,Web 凭证可实时更新 |
+| `GET /api/devices` | 结构化设备列表 + 运行时状态:`{name, uuid, soap_port, rtsp_port, running, error?, auth_user, endpoints:{device_service, snapshot, streams:[{name, profile_token, rtsp_uri, rtsp, codec, width, height, framerate, bitrate, proxy_port, has_credentials}]}}`。上游 `rtsp` URL **不返回 userinfo**;`has_credentials` 表示服务端是否保存了凭证。其他流字段用于预填编辑表单。`GET /api/config` 仍是明确返回完整 YAML 的认证入口 |
+| `POST /api/devices` | Body JSON DeviceSpec `{name, soap_port, rtsp_port, auth?, streams:[{name,rtsp,codec,width,height,framerate,bitrate,proxy_port?}], snapshot?}`。合入当前 YAML 后走与 `PUT /api/config` 相同的事务式流程;uuid/mac/serial 在准备阶段生成。校验失败(含端口冲突)返回 400,成功 `{"status":"applied"}` |
+| `PUT /api/devices/{uuid}` | Body 与 POST 相同的 DeviceSpec。按 uuid 定位设备(未知 404)→ 用表单值构建新 Device,**原位替换**,但**保留原 uuid/mac/serial 与 info**(表单不携带这些)→ 校验 → 落盘 → 热重载。成功 `{"status":"applied"}`,校验/端口冲突 400 透传。**凭证保留语义**:保留 ONVIF 用户名且密码留空时维持原 ONVIF 密码;RTSP URL 不带 userinfo 时按流的唯一 name 保留原 userinfo,显式填写新 userinfo 则替换 |
 | `DELETE /api/devices/{uuid}` | 按 uuid 从当前配置删除设备 → 校验 → 落盘 → 热重载。未知 uuid 返回 404,成功 `{"status":"applied"}` |
 
 ### 1.2 测试工具(对应 UI 测试面板)
@@ -24,7 +24,7 @@ Web 服务默认监听 `:8080`,提供 REST API 与内嵌单页 UI。可选 HTTP 
 | 方法/路径 | 说明 |
 |-----------|------|
 | `POST /api/test/rtsp` | Body `{"url": "rtsp://..."}`。原生 RTSP 探测(OPTIONS + DESCRIBE + Digest/Basic 认证),返回:`{"ok":true, "status":200, "auth":"digest", "server":"...", "tracks":[{"type":"video","codec":"H264","fmtp":"..."}], "latency_ms": 43}`。错误分类:`dial_timeout` / `auth_failed` / `not_found` / `no_video_track` / `protocol_error` |
-| `POST /api/test/streaminfo` | Body `{"url": "rtsp://..."}`。ffprobe 探测首个视频流,返回 `{"codec":"h264","width":1920,"height":1080,"fps":25,"bitrate":2048}`,供新增设备表单回填。`bitrate`(kbps):源声明了就用声明值,否则 ffmpeg 拉流 3 秒按实际字节实测;测不出为 0(表单保留手填值)。ffmpeg 不可用返回 501 |
+| `POST /api/test/streaminfo` | Body `{"url": "rtsp://..."}`。ffprobe 探测首个视频流,返回 `{"codec":"h264","width":1920,"height":1080,"fps":25,"bitrate":2048}`,供新增设备表单回填。`bitrate`(kbps):源声明了就用声明值,否则 ffmpeg 拉流 3 秒按实际字节实测;测不出为 0(表单保留手填值)。ffprobe 不可用返回 501 |
 | `GET /api/test/snapshot?device=<uuid>&stream=<name>` | 调 ffmpeg 从指定流抓一帧(`stream` 省略取主流),返回 `image/jpeg`。失败返回 JSON 错误(含 ffmpeg stderr 摘要) |
 | `GET /api/preview?device=<uuid>&stream=<name>` | **MJPEG 实时预览**:ffmpeg 拉指定流 → `-f mpjpeg`(缩至 640 宽、5fps、静音)→ `multipart/x-mixed-replace` 推给浏览器,`<img>` 直接播。客户端断开即杀 ffmpeg;每设备并发预览数上限 2 |
 | `POST /api/test/onvif?device=<uuid>` | **ONVIF 自检**:服务端以 ONVIF 客户端身份调用自己的 SOAP 端点,逐方法返回 `{method, http_status, soap_fault, pass}`。覆盖方法:GetSystemDateAndTime、GetCapabilities、GetServices、GetScopes、GetNetworkInterfaces、GetDeviceInformation、GetProfiles、GetStreamUri、GetSnapshotUri + 一个故意不存在的方法(验证 Fault 规范性) |
@@ -73,7 +73,7 @@ AI 客户端;与 REST API 同端口、同 Basic 认证。协议、工具清单�
 
 - YAML 全文编辑器(textarea + 等宽字体,不引前端依赖);
 - "校验"按钮:dry-run 调 `PUT /api/config?dry_run=1`,只报错不落盘;
-- "保存并生效"按钮:落盘 + 热重载,展示重载结果;
+- "保存并生效"按钮:事务式切换运行态并原子落盘,展示校验、绑定或回滚结果;
 - 顶部提示条:配置文件路径、上次保存时间。
 
 ### 2.3 新增设备向导(表单)

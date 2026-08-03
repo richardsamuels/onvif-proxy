@@ -83,12 +83,17 @@ const zh = {
   fieldStreamName: "名称",
   fieldRtspUrl: "RTSP URL",
   phRtspUrl: "rtsp://user:pass@host:554/path",
+  fieldCodec: "编码",
+  codecUnsupported: (codec: string) => `${codec || "未知"}(Profile S 不支持)`,
   btnProbe: "探测",
   btnRemove: "移除",
   fieldWidth: "宽",
   fieldHeight: "高",
   fieldFramerate: "帧率",
   fieldBitrate: "码率(kbps)",
+  fieldProxyPort: "代理端口",
+  phPrimaryProxyPort: "使用设备 RTSP 端口",
+  phProxyPort: "不同上游时必填",
   addSubStream: "+ 添加子码流",
   fieldSoapPort: "SOAP 端口",
   fieldRtspPort: "RTSP 端口",
@@ -96,7 +101,7 @@ const zh = {
   fieldOnvifPass: "ONVIF 密码(可选)",
   phKeepPass: "留空 = 保持原密码",
   rtspAuthNote:
-    "RTSP URL 中的账密(user:pass@)只供本代理抓快照/探测使用,不会下发给 ONVIF 客户端;客户端拉流时由真实摄像头直接认证,所以在 Unifi Protect 等客户端里收编时填的账密必须是摄像头本身的 RTSP 账密。",
+    "设备列表不会下发 RTSP URL 中已保存的账密;编辑时 URL 留空 userinfo 会保留原账密,输入新的 user:pass@ 可替换。不同上游地址的子码流需要填写独立代理端口;相同上游的多条流共用同一端口。",
   onvifAuthNote:
     "ONVIF 认证(WSSE)与上面的 RTSP 密码是独立的两层:这里保护的是虚拟设备的 ONVIF 接口。留空 = 不校验(推荐)。若要设置,建议与摄像头 RTSP 账密相同 —— Unifi Protect 只让填一组账密,并同时用于 ONVIF 与 RTSP 两层。",
 
@@ -116,9 +121,12 @@ const zh = {
   vRtspPort: "RTSP 端口无效",
   vStreamName: (label: string) => `${label}:名称需为小写字母/数字/下划线`,
   vStreamRtsp: (label: string) => `${label}:RTSP URL 必须以 rtsp:// 开头`,
+  vCodec: (label: string) => `${label}:编码仅支持 H.264、JPEG/MJPEG 或 MPEG-4`,
+  vCodecH265: (label: string) => `${label}:ONVIF Profile S 不支持 H.265/HEVC,请改用 H.264`,
   vStreamSize: (label: string) => `${label}:宽/高未填 —— 点“探测”自动回填,或手动填写`,
   vStreamFps: (label: string) => `${label}:帧率未填`,
   vStreamBitrate: (label: string) => `${label}:码率未填`,
+  vProxyPort: (label: string) => `${label}:代理端口无效`,
 
   // DeviceModal — per-stream probe
   fillRtspFirst: "请先填写 RTSP URL。",
@@ -129,7 +137,7 @@ const zh = {
     `已回填: ${codec} ${width}×${height} @${fps}fps`,
   bitrateMeasured: (kbps: number) => ` · 实测码率 ${kbps} kbps`,
   bitrateUnknown: " · 码率未知,保留手填值",
-  ffmpegManual: "ffmpeg 不可用,分辨率/帧率请手填。",
+  ffmpegManual: "ffprobe 不可用,分辨率/帧率请手填。",
   fillFailed: (detail: string) => `回填失败: ${detail}`,
 
   // ConfigEditor
@@ -213,12 +221,17 @@ const en: Dict = {
   fieldStreamName: "Name",
   fieldRtspUrl: "RTSP URL",
   phRtspUrl: "rtsp://user:pass@host:554/path",
+  fieldCodec: "Codec",
+  codecUnsupported: (codec: string) => `${codec || "unknown"} (unsupported by Profile S)`,
   btnProbe: "Probe",
   btnRemove: "Remove",
   fieldWidth: "Width",
   fieldHeight: "Height",
   fieldFramerate: "Frame rate",
   fieldBitrate: "Bitrate (kbps)",
+  fieldProxyPort: "Proxy port",
+  phPrimaryProxyPort: "Uses device RTSP port",
+  phProxyPort: "Required for another upstream",
   addSubStream: "+ Add sub-stream",
   fieldSoapPort: "SOAP port",
   fieldRtspPort: "RTSP port",
@@ -226,7 +239,7 @@ const en: Dict = {
   fieldOnvifPass: "ONVIF password (optional)",
   phKeepPass: "Leave blank = keep current password",
   rtspAuthNote:
-    "The credentials in the RTSP URL (user:pass@) are used only by this proxy to grab snapshots and probe streams — they are never handed to ONVIF clients. Clients authenticate directly against the real camera when pulling video, so the credentials you enter when adopting the device in Unifi Protect and similar clients must be the camera's own RTSP credentials.",
+    "Saved RTSP URL credentials are omitted from the device list. Editing a URL without userinfo keeps its stored credentials; enter new user:pass@ to replace them. Sub-streams on another upstream address need a proxy port; streams on the same upstream share one port.",
   onvifAuthNote:
     "ONVIF authentication (WSSE) is a separate layer from the RTSP password above: it protects the virtual device's ONVIF interface. Blank = no check (recommended). If you do set it, use the same credentials as the camera's RTSP login — Unifi Protect only accepts one credential pair and applies it to both the ONVIF and RTSP layers.",
 
@@ -244,9 +257,12 @@ const en: Dict = {
   vRtspPort: "RTSP port is invalid",
   vStreamName: (label: string) => `${label}: name must be lowercase letters, digits, or underscores`,
   vStreamRtsp: (label: string) => `${label}: RTSP URL must start with rtsp://`,
+  vCodec: (label: string) => `${label}: codec must be H.264, JPEG/MJPEG, or MPEG-4`,
+  vCodecH265: (label: string) => `${label}: ONVIF Profile S does not support H.265/HEVC; use H.264`,
   vStreamSize: (label: string) => `${label}: width/height missing — click Probe to autofill, or enter manually`,
   vStreamFps: (label: string) => `${label}: frame rate is required`,
   vStreamBitrate: (label: string) => `${label}: bitrate is required`,
+  vProxyPort: (label: string) => `${label}: proxy port is invalid`,
 
   fillRtspFirst: "Enter the RTSP URL first.",
   probingConn: "Testing connectivity…",
@@ -256,7 +272,7 @@ const en: Dict = {
     `Autofilled: ${codec} ${width}×${height} @${fps}fps`,
   bitrateMeasured: (kbps: number) => ` · measured bitrate ${kbps} kbps`,
   bitrateUnknown: " · bitrate unknown, keeping your value",
-  ffmpegManual: "ffmpeg unavailable — enter resolution/frame rate manually.",
+  ffmpegManual: "ffprobe unavailable — enter resolution/frame rate manually.",
   fillFailed: (detail: string) => `Autofill failed: ${detail}`,
 
   configNote: "Full config.yaml. Store plaintext camera passwords here only after enabling web auth.",

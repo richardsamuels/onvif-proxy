@@ -8,6 +8,26 @@ import { AsyncButton } from "./AsyncButton";
 import { Msg } from "./Msg";
 
 const SUB_NAMES = ["sub", "mobile", "third", "fourth"];
+const PROFILE_S_CODECS = ["h264", "jpeg", "mpeg4"];
+
+function normalizeCodec(codec: string): string {
+  switch (codec.trim().toLowerCase()) {
+    case "h264":
+    case "avc":
+      return "h264";
+    case "jpeg":
+    case "mjpeg":
+    case "jpg":
+      return "jpeg";
+    case "mpeg4":
+      return "mpeg4";
+    case "h265":
+    case "hevc":
+      return "h265";
+    default:
+      return codec.trim().toLowerCase();
+  }
+}
 
 // rtspHint maps a backend err_kind to its localised explanation.
 function rtspHint(t: Dict, kind: string): string {
@@ -31,10 +51,12 @@ interface StreamRow {
   id: number;
   name: string;
   rtsp: string;
+  codec: string;
   width: string;
   height: string;
   framerate: string;
   bitrate: string;
+  proxyPort: string;
   out: ComponentChild;
 }
 
@@ -44,30 +66,39 @@ function newRow(name: string, rtsp = "", init: Partial<StreamRow> = {}): StreamR
     id: rowSeq++,
     name,
     rtsp,
+    codec: "h264",
     width: "",
     height: "",
     framerate: "",
     bitrate: "4096",
+    proxyPort: "",
     out: null,
     ...init,
   };
 }
 
-// suggestPorts derives the next free soap/rtsp port pair from the running
-// devices (soap from 8081, rtsp from 8554), matching the old UI heuristic.
+// suggestPorts finds a free soap/rtsp port pair while accounting for every
+// device port and per-upstream proxy port already visible in the list DTO.
 async function suggestPorts(): Promise<{ soap: number; rtsp: number }> {
-  let soap = 8080;
-  let rtsp = 8553;
+  const used = new Set<number>([8080]);
   try {
     const list = await apiJSON<DeviceView[]>("/api/devices");
     for (const d of list || []) {
-      if (d.soap_port > soap) soap = d.soap_port;
-      if (d.rtsp_port > rtsp) rtsp = d.rtsp_port;
+      used.add(d.soap_port);
+      used.add(d.rtsp_port);
+      for (const stream of d.endpoints.streams) {
+        if (stream.proxy_port) used.add(stream.proxy_port);
+      }
     }
   } catch {
     /* fall back to defaults */
   }
-  return { soap: soap + 1, rtsp: rtsp + 1 };
+  const nextFree = (start: number) => {
+    while (used.has(start)) start++;
+    used.add(start);
+    return start;
+  };
+  return { soap: nextFree(8081), rtsp: nextFree(8554) };
 }
 
 interface Props {
@@ -97,9 +128,11 @@ export function DeviceModal({ mode, device, onClose, onSaved }: Props) {
       return device.endpoints.streams.map((s) =>
         newRow(s.name, s.rtsp, {
           width: s.width ? String(s.width) : "",
+          codec: s.codec || "h264",
           height: s.height ? String(s.height) : "",
           framerate: s.framerate ? String(s.framerate) : "",
           bitrate: s.bitrate ? String(s.bitrate) : "4096",
+          proxyPort: s.proxy_port ? String(s.proxy_port) : "",
         }),
       );
     }
@@ -157,7 +190,9 @@ export function DeviceModal({ mode, device, onClose, onSaved }: Props) {
         return;
       }
       const tracks = (j.tracks || []).map((x) => `${x.type}:${x.codec}`).join(", ");
+      const videoCodec = (j.tracks || []).find((x) => x.type.toLowerCase() === "video")?.codec;
       patchRow(row.id, {
+        ...(videoCodec ? { codec: normalizeCodec(videoCodec) } : {}),
         out: <Msg kind="ok">{t.rtspOkShort(j.auth, j.latency_ms, tracks || "-")}</Msg>,
       });
       await fillStreamInfo(row.id, url);
@@ -172,6 +207,7 @@ export function DeviceModal({ mode, device, onClose, onSaved }: Props) {
       const j = await apiJSON<StreamInfo>("/api/test/streaminfo", jsonBody({ url }));
       const patch: Partial<StreamRow> = {};
       if (j.width) patch.width = String(j.width);
+      if (j.codec) patch.codec = normalizeCodec(j.codec);
       if (j.height) patch.height = String(j.height);
       if (j.fps) patch.framerate = String(j.fps);
       if (j.bitrate) patch.bitrate = String(j.bitrate);
@@ -204,10 +240,12 @@ export function DeviceModal({ mode, device, onClose, onSaved }: Props) {
       streams: streams.map((s) => ({
         name: s.name.trim(),
         rtsp: s.rtsp.trim(),
+        codec: s.codec,
         width: num(s.width),
         height: num(s.height),
         framerate: num(s.framerate),
         bitrate: num(s.bitrate),
+        ...(num(s.proxyPort) ? { proxy_port: num(s.proxyPort) } : {}),
       })),
     };
     const user = authUser.trim();
@@ -226,9 +264,15 @@ export function DeviceModal({ mode, device, onClose, onSaved }: Props) {
       const label = t.streamRowLabel(i + 1, s.name || t.unnamedStream);
       if (!/^[a-z0-9_]+$/.test(s.name)) problems.push(t.vStreamName(label));
       if (!s.rtsp.startsWith("rtsp://")) problems.push(t.vStreamRtsp(label));
+      if (!PROFILE_S_CODECS.includes(s.codec)) {
+        problems.push(s.codec === "h265" ? t.vCodecH265(label) : t.vCodec(label));
+      }
       if (s.width <= 0 || s.height <= 0) problems.push(t.vStreamSize(label));
       if (s.framerate <= 0) problems.push(t.vStreamFps(label));
       if (s.bitrate <= 0) problems.push(t.vStreamBitrate(label));
+      if (s.proxy_port !== undefined && (s.proxy_port <= 0 || s.proxy_port > 65535)) {
+        problems.push(t.vProxyPort(label));
+      }
     });
     if (problems.length > 0) {
       setMsg(
@@ -298,7 +342,20 @@ export function DeviceModal({ mode, device, onClose, onSaved }: Props) {
                   </button>
                 )}
               </div>
-              <div class="grid4">
+              <div class="grid6">
+                <div class="field">
+                  <label>{t.fieldCodec}</label>
+                  <select value={row.codec} onInput={(e) => patchRow(row.id, { codec: e.currentTarget.value })}>
+                    {!PROFILE_S_CODECS.includes(row.codec) && (
+                      <option value={row.codec} disabled>
+                        {t.codecUnsupported(row.codec)}
+                      </option>
+                    )}
+                    <option value="h264">H.264</option>
+                    <option value="jpeg">JPEG / MJPEG</option>
+                    <option value="mpeg4">MPEG-4</option>
+                  </select>
+                </div>
                 <div class="field">
                   <label>{t.fieldWidth}</label>
                   <input type="number" value={row.width} onInput={(e) => patchRow(row.id, { width: e.currentTarget.value })} />
@@ -314,6 +371,16 @@ export function DeviceModal({ mode, device, onClose, onSaved }: Props) {
                 <div class="field">
                   <label>{t.fieldBitrate}</label>
                   <input type="number" value={row.bitrate} onInput={(e) => patchRow(row.id, { bitrate: e.currentTarget.value })} />
+                </div>
+                <div class="field">
+                  <label>{t.fieldProxyPort}</label>
+                  <input
+                    type="number"
+                    value={row.proxyPort}
+                    disabled={idx === 0}
+                    placeholder={idx === 0 ? t.phPrimaryProxyPort : t.phProxyPort}
+                    onInput={(e) => patchRow(row.id, { proxyPort: e.currentTarget.value })}
+                  />
                 </div>
               </div>
               {row.out && <div class="s-out">{row.out}</div>}

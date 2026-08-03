@@ -177,6 +177,8 @@ func (s *Server) mcpGetConfig(_ context.Context, _ *mcp.CallToolRequest, _ noInp
 }
 
 func (s *Server) mcpApplyConfig(_ context.Context, _ *mcp.CallToolRequest, in applyConfigInput) (*mcp.CallToolResult, any, error) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	if err := s.backend.ApplyConfig([]byte(in.YAML), in.DryRun); err != nil {
 		return nil, nil, err
 	}
@@ -187,6 +189,8 @@ func (s *Server) mcpApplyConfig(_ context.Context, _ *mcp.CallToolRequest, in ap
 }
 
 func (s *Server) mcpAddDevice(_ context.Context, _ *mcp.CallToolRequest, in addDeviceInput) (*mcp.CallToolResult, any, error) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	cfg, err := s.currentConfig()
 	if err != nil {
 		return nil, nil, err
@@ -199,6 +203,8 @@ func (s *Server) mcpAddDevice(_ context.Context, _ *mcp.CallToolRequest, in addD
 }
 
 func (s *Server) mcpUpdateDevice(_ context.Context, _ *mcp.CallToolRequest, in updateDeviceInput) (*mcp.CallToolResult, any, error) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	cfg, err := s.currentConfig()
 	if err != nil {
 		return nil, nil, err
@@ -220,6 +226,7 @@ func (s *Server) mcpUpdateDevice(_ context.Context, _ *mcp.CallToolRequest, in u
 	dev.MAC = orig.MAC
 	dev.Serial = orig.Serial
 	dev.Info = orig.Info
+	preserveRTSPCredentials(dev, orig)
 	// Same "blank password = unchanged" rule as handleEditDevice: the device DTO
 	// never exposes the ONVIF password, so a kept username with an empty password
 	// means "leave it alone", not "clear it".
@@ -236,6 +243,8 @@ func (s *Server) mcpUpdateDevice(_ context.Context, _ *mcp.CallToolRequest, in u
 }
 
 func (s *Server) mcpDeleteDevice(_ context.Context, _ *mcp.CallToolRequest, in uuidInput) (*mcp.CallToolResult, any, error) {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	cfg, err := s.currentConfig()
 	if err != nil {
 		return nil, nil, err
@@ -270,7 +279,7 @@ func (s *Server) mcpProbeRTSP(ctx context.Context, _ *mcp.CallToolRequest, in ur
 }
 
 func (s *Server) mcpGetStreamInfo(ctx context.Context, _ *mcp.CallToolRequest, in urlInput) (*mcp.CallToolResult, any, error) {
-	if !mediautil.Available() {
+	if !mediautil.ProbeAvailable() {
 		return nil, nil, fmt.Errorf("ffprobe is required for stream probing but is not on PATH")
 	}
 	if err := validateRTSPURL(in.URL); err != nil {

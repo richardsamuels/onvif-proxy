@@ -6,11 +6,15 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -46,6 +50,7 @@ type Backend interface {
 type DeviceRuntime struct {
 	Device  *config.Device
 	Running bool
+	Error   string
 }
 
 // Status is the payload of GET /api/status.
@@ -64,11 +69,60 @@ type Server struct {
 
 	previewMu  sync.Mutex
 	previewSem map[string]int // device uuid -> active preview count
+
+	// configMu serializes every read-modify-write config operation across the
+	// REST and MCP surfaces, preventing concurrent device edits from silently
+	// overwriting one another.
+	configMu sync.Mutex
 }
 
 const maxPreviewPerDevice = 2
 
-// New builds a Server. Basic authentication is wired in when a username is set.
+const (
+	maxConfigBodyBytes = 1 << 20
+	maxDeviceBodyBytes = 1 << 20
+	maxProbeBodyBytes  = 1 << 16
+	maxMCPBodyBytes    = 1 << 20
+)
+
+var errRequestBodyTooLarge = errors.New("request body exceeds size limit")
+
+// readRequestBody reads at most max bytes and explicitly detects overflow.
+// io.LimitReader(max) alone can silently truncate a valid JSON/YAML prefix.
+func readRequestBody(r *http.Request, max int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > max {
+		return nil, errRequestBodyTooLarge
+	}
+	return body, nil
+}
+
+func decodeJSONBody(r *http.Request, max int64, dst any) error {
+	body, err := readRequestBody(r, max)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(body, dst)
+}
+
+func writeBodyError(w http.ResponseWriter, label string, err error) {
+	if errors.Is(err, errRequestBodyTooLarge) {
+		writeErr(w, http.StatusRequestEntityTooLarge, "request body too large", err.Error())
+		return
+	}
+	writeErr(w, http.StatusBadRequest, label, err.Error())
+}
+
+type webConfigProvider interface {
+	WebConfig() config.WebConfig
+}
+
+// New builds a Server. Basic authentication is evaluated for every request so
+// a Backend that implements webConfigProvider can rotate credentials on a hot
+// reload without restarting the listening socket.
 func New(cfg config.WebConfig, backend Backend) *Server {
 	s := &Server{
 		cfg:        cfg,
@@ -91,7 +145,7 @@ func New(cfg config.WebConfig, backend Backend) *Server {
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	// MCP endpoint: the SDK's Streamable HTTP handler owns GET/POST/DELETE
 	// semantics, so it is mounted without a method filter.
-	mux.Handle("/mcp", s.mcpHandler())
+	mux.Handle("/mcp", limitBody(s.mcpHandler(), maxMCPBodyBytes))
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	// Serve the built bundle (dist/app.js, dist/app.css) straight from the
 	// embedded FS; the sub-FS strips the "static/" prefix so /dist/* maps to
@@ -109,11 +163,34 @@ func New(cfg config.WebConfig, backend Backend) *Server {
 	return s
 }
 
+func limitBody(next http.Handler, max int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, max)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Run serves until ctx is cancelled, then shuts down gracefully.
 func (s *Server) Run(ctx context.Context) error {
+	ln, err := net.Listen("tcp4", fmt.Sprintf(":%d", s.cfg.Port))
+	if err != nil {
+		return err
+	}
+	return s.Serve(ctx, ln)
+}
+
+// Serve runs the web server on an already-bound listener. This lets main
+// surface a port conflict synchronously before reporting startup success.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.cfg.Port),
-		Handler: s.handler,
+		Addr:              fmt.Sprintf(":%d", s.cfg.Port),
+		Handler:           s.handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       20 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    32 << 10,
 	}
 	go func() {
 		<-ctx.Done()
@@ -121,7 +198,7 @@ func (s *Server) Run(ctx context.Context) error {
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
@@ -129,12 +206,21 @@ func (s *Server) Run(ctx context.Context) error {
 
 // withAuth enforces HTTP Basic auth across every route when configured.
 func (s *Server) withAuth(next http.Handler) http.Handler {
-	if s.cfg.Username == "" {
-		return next
-	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.cfg
+		if provider, ok := s.backend.(webConfigProvider); ok {
+			cfg = provider.WebConfig()
+		}
+		if cfg.Username == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		user, pass, ok := r.BasicAuth()
-		if !ok || user != s.cfg.Username || pass != s.cfg.Password {
+		gotUser, wantUser := sha256.Sum256([]byte(user)), sha256.Sum256([]byte(cfg.Username))
+		gotPass, wantPass := sha256.Sum256([]byte(pass)), sha256.Sum256([]byte(cfg.Password))
+		valid := subtle.ConstantTimeCompare(gotUser[:], wantUser[:]) &
+			subtle.ConstantTimeCompare(gotPass[:], wantPass[:])
+		if !ok || valid != 1 {
 			w.Header().Set("WWW-Authenticate", `Basic realm="onvif-proxy"`)
 			writeErr(w, http.StatusUnauthorized, "unauthorized", "authentication required")
 			return

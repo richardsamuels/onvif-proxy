@@ -223,3 +223,23 @@ func TestTypesMatch(t *testing.T) {
 		}
 	}
 }
+
+func TestDiffDevicesTreatsMetadataChangeAsReplace(t *testing.T) {
+	original := sampleDevice()
+	changed := original
+	changed.Name = "Back Door"
+	changed.XAddr = "http://192.168.1.10:9000/onvif/device_service"
+
+	removed, added := diffDevices([]Device{original}, []Device{changed})
+	if len(removed) != 1 || removed[0] != original {
+		t.Fatalf("removed = %#v, want original device", removed)
+	}
+	if len(added) != 1 || added[0] != changed {
+		t.Fatalf("added = %#v, want changed device", added)
+	}
+
+	removed, added = diffDevices([]Device{changed}, []Device{changed})
+	if len(removed) != 0 || len(added) != 0 {
+		t.Fatalf("unchanged metadata diff = removed %#v, added %#v", removed, added)
+	}
+}

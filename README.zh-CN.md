@@ -12,10 +12,12 @@
 
 - **ONVIF Profile S 必选方法全覆盖** —— Device 与 Media 服务的必选方法全部实现;未实现的可选方法返回规范的 `ter:ActionNotSupported` SOAP Fault,而非裸 500。
 - **每设备多媒体 Profile** —— 不限于高/低两档:可定义任意数量的命名流(`main` / `sub` / `mobile` / …),每条流对应一个独立的 ONVIF Profile、编码配置与流地址。
+- **如实声明编码** —— 每个 Profile 在配置、Options 和保证实例计数中一致声明 H.264、JPEG/MJPEG 或 MPEG-4。ONVIF Profile S 没有 H.265 编码器类型,因此会明确拒绝 H.265/HEVC。
 - **快照支持** —— `GetSnapshotUri` 开箱即用:真实摄像头自带 HTTP 快照接口则直接透传,没有则由内置 ffmpeg 从 RTSP 流抓取 JPEG 帧(带短 TTL 缓存)。补上了上游项目缺失的能力。
 - **WS-Discovery** —— UDP 3702 组播发现,Hello / Bye / ProbeMatches 齐全,客户端可自动发现虚拟设备。
 - **零转码 RTSP 代理** —— 每设备一个 TCP 透传代理,字节原样转发到真实摄像头;不解码不转码,无 CPU 开销。ffmpeg 仅用于快照与 UI 预览。
 - **Web UI** —— 除 YAML 配置文件外,内嵌小型 Web 后端:在线编辑配置、RTSP 连通性探测(原生 RTSP 客户端,支持 Digest/Basic 认证与 SDP 解析)、抓取快照、MJPEG 实时预览、对虚拟设备本身做 ONVIF 自检。
+- **事务式热重载** —— 配置变更会先完成校验和 listener 预留再提交;绑定或落盘失败会恢复旧运行态,旧配置文件保持不变。
 - **Docker 优先部署** —— 多阶段构建,镜像内置 ffmpeg;提供 macvlan compose 示例,每台虚拟设备可在局域网拿到独立 IP/MAC。
 - **单二进制、极少依赖** —— 仅依赖 `gopkg.in/yaml.v3` 与官方 MCP `go-sdk`;SOAP 报文为手写 XML 模板,不用 WSDL 代码生成。
 - **内置 MCP 服务端点** —— `/mcp`(Streamable HTTP)把设备增删改查、RTSP 探测、快照、ONVIF 自检等能力以 MCP 工具形式暴露给 Claude Code 等 AI 客户端(见 [docs/07-mcp.zh-CN.md](docs/07-mcp.zh-CN.md))。
@@ -29,6 +31,7 @@
 | [docs/03-config.zh-CN.md](docs/03-config.zh-CN.md) | YAML 配置格式与校验规则 |
 | [docs/04-web-api.zh-CN.md](docs/04-web-api.zh-CN.md) | Web 后端 REST API 与 UI 设计 |
 | [docs/05-deployment.zh-CN.md](docs/05-deployment.zh-CN.md) | Docker / macvlan 部署方案 |
+| [docs/06-internal-api.zh-CN.md](docs/06-internal-api.zh-CN.md) | 包间导出接口与集成契约 |
 | [docs/07-mcp.zh-CN.md](docs/07-mcp.zh-CN.md) | 内置 MCP 服务端点(`/mcp`)、工具清单、实现契约 |
 
 ## 快速开始(Docker)
@@ -45,14 +48,16 @@ Tag 规则:`latest`(main)、`main`、`sha-<短哈希>`、发版时的 `vX.Y.Z`�
 ```bash
 # Linux host 网络(最简单;组播发现可用)
 docker run -d --name onvif-proxy --network host \
-  -v "$(pwd)/config:/config" \
+  -v onvif-proxy-config:/config \
   ghcr.io/aiaid/onvif-proxy:latest
 
 # 打开 Web UI,用表单添加设备
 open http://<host>:8080
 ```
 
-首次运行**无需准备配置文件** —— 会自动生成 `./config/config.yaml`,设备完全可以通过 Web UI 添加("➕ 新增设备"表单会探测你的 RTSP URL 并自动回填分辨率/帧率)。macvlan(每个代理独立 IP/MAC,Unifi Protect 体验最佳)或 bridge 模式(Docker Desktop)见 [docs/05-deployment.zh-CN.md](docs/05-deployment.zh-CN.md) 与 [compose.yaml](compose.yaml)。
+首次运行**无需准备配置文件** —— 会在 `onvif-proxy-config` volume 中自动生成默认配置,设备完全可以通过 Web UI 添加("➕ 新增设备"表单会探测你的 RTSP URL 并自动回填分辨率/帧率)。镜像以非 root 用户 `10001:10001` 运行,使用 named volume 无需修改宿主机目录权限。host bind mount、备份、macvlan(每个代理独立 IP/MAC)及 bridge 模式(Docker Desktop)见 [docs/05-deployment.zh-CN.md](docs/05-deployment.zh-CN.md) 与 [compose.yaml](compose.yaml)。
+
+默认的 Web UI/MCP listener 没有密码。请仅在可信网络中使用,或在暴露主机前设置 `ONVIF_WEB_USERNAME` 与 `ONVIF_WEB_PASSWORD`。完整配置编辑器在通过认证后仍会显示摄像头凭证,这是设计行为。
 
 全局配置也支持环境变量覆盖(`-e ONVIF_WEB_USERNAME=admin -e ONVIF_WEB_PASSWORD=…` 给 Web UI 配 Basic 认证,另有 `ONVIF_ADVERTISE_IP`、`ONVIF_DISCOVERY`、`ONVIF_WEB_ENABLED`、`ONVIF_WEB_PORT`)。env 优先于 YAML,仅内存生效,绝不写回挂载的配置文件 —— 详见 [docs/03-config.zh-CN.md](docs/03-config.zh-CN.md) 第 3 节。
 
@@ -67,12 +72,15 @@ services:
     network_mode: host          # 或 macvlan / bridge,见 docs/05-deployment.zh-CN.md
     restart: unless-stopped
     volumes:
-      - ./config:/config
+      - onvif-config:/config
     environment:
       ONVIF_WEB_USERNAME: admin
       ONVIF_WEB_PASSWORD: change-me
       ONVIF_ADVERTISE_IP: "192.168.1.10"   # bridge 模式下必填
       ONVIF_WEB_PORT: "9090"
+
+volumes:
+  onvif-config:
 ```
 
 ### config.yaml 示例
@@ -96,6 +104,7 @@ devices:
     streams:
       - name: main
         rtsp: "rtsp://user:pass@192.168.1.50:554/h264/ch1/main/av_stream"
+        codec: h264
         width: 1920
         height: 1080
         framerate: 25
@@ -111,13 +120,14 @@ devices:
 | 层 | 配置位置 | 谁来校验 | 作用 |
 |----|----------|----------|------|
 | RTSP 密码 | `streams[].rtsp` URL 里的 `user:pass@` | **真实摄像头** | 拉流认证 |
-| ONVIF 密码 | `devices[].auth`(可省略) | **onvif-proxy 本身**(WSSE) | 保护虚拟设备的 SOAP 接口 |
+| ONVIF 密码 | `devices[].auth`(可省略) | **onvif-proxy 本身**(WSSE + HTTP Basic) | 保护 SOAP 与快照 HTTP 接口 |
 
 关键行为:
 
 - RTSP 代理是纯 TCP 透传,**RTSP 认证端到端**:`GetStreamUri` 返回的地址不含凭证,ONVIF 客户端必须用**真实摄像头的 RTSP 账密**向摄像头本身认证;
 - 配置里 URL 带的 `user:pass@` 只供 onvif-proxy 自己使用(快照、预览、探测),不会下发给 ONVIF 客户端;
-- 不配 `devices[].auth` = ONVIF 接口全放行(可信内网推荐)。
+- 配置 `devices[].auth` 后,SOAP 使用 WSSE,快照 URL 使用同一组账号密码的 HTTP Basic。Basic 不加密传输,请使用可信局域网或 TLS 终止;
+- 不配 `devices[].auth` = ONVIF 与快照接口全放行(仅推荐可信内网)。
 
 **Unifi Protect 提示**:Protect 收编时只让填一组账密,并同时用于两层。请填**真实摄像头的 RTSP 账密**,且 `devices[].auth` 要么不配、要么配成完全相同的一组 —— 千万不要配成不同的。
 
@@ -133,4 +143,4 @@ devices:
 
 ## License
 
-MIT
+[MIT](LICENSE)

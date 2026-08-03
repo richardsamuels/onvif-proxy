@@ -58,6 +58,8 @@ const (
 	dialTimeout  = 5 * time.Second
 	totalTimeout = 5 * time.Second
 	maxFmtpLen   = 200
+	maxHeaderLen = 64 << 10
+	maxBodyLen   = 1 << 20
 )
 
 // Probe connects to rawURL, runs OPTIONS then DESCRIBE (retrying once with
@@ -67,7 +69,7 @@ func Probe(ctx context.Context, rawURL string) *Result {
 	res := &Result{Auth: "none"}
 
 	u, err := url.Parse(rawURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	if err != nil || !strings.EqualFold(u.Scheme, "rtsp") || u.Hostname() == "" {
 		res.ErrKind = ErrProtocol
 		res.ErrDetail = "invalid RTSP URL"
 		return res
@@ -77,10 +79,11 @@ func Probe(ctx context.Context, rawURL string) *Result {
 	ctx, cancel := context.WithTimeout(ctx, totalTimeout)
 	defer cancel()
 
-	host := u.Host
-	if _, _, err := net.SplitHostPort(host); err != nil {
-		host = net.JoinHostPort(host, defaultRTSP)
+	port := u.Port()
+	if port == "" {
+		port = defaultRTSP
 	}
+	host := net.JoinHostPort(u.Hostname(), port)
 
 	start := time.Now()
 
@@ -291,10 +294,11 @@ type response struct {
 
 // readResponse reads a status line, CRLF headers and a Content-Length body.
 func readResponse(br *bufio.Reader) (*response, error) {
-	statusLine, err := br.ReadString('\n')
+	statusLine, err := readLimitedLine(br, maxHeaderLen)
 	if err != nil {
 		return nil, err
 	}
+	headerBytes := len(statusLine)
 	statusLine = strings.TrimRight(statusLine, "\r\n")
 	// Expected: RTSP/1.0 200 OK
 	parts := strings.SplitN(statusLine, " ", 3)
@@ -308,10 +312,11 @@ func readResponse(br *bufio.Reader) (*response, error) {
 
 	resp := &response{status: code, headers: make(map[string]string)}
 	for {
-		line, err := br.ReadString('\n')
+		line, err := readLimitedLine(br, maxHeaderLen-headerBytes)
 		if err != nil {
 			return nil, err
 		}
+		headerBytes += len(line)
 		line = strings.TrimRight(line, "\r\n")
 		if line == "" {
 			break
@@ -331,6 +336,9 @@ func readResponse(br *bufio.Reader) (*response, error) {
 		if err != nil {
 			return nil, fmt.Errorf("malformed Content-Length: %q", cl)
 		}
+		if n < 0 || n > maxBodyLen {
+			return nil, fmt.Errorf("RTSP response body exceeds %d bytes", maxBodyLen)
+		}
 		if n > 0 {
 			buf := make([]byte, n)
 			if _, err := io.ReadFull(br, buf); err != nil {
@@ -340,6 +348,26 @@ func readResponse(br *bufio.Reader) (*response, error) {
 		}
 	}
 	return resp, nil
+}
+
+func readLimitedLine(br *bufio.Reader, limit int) (string, error) {
+	if limit <= 0 {
+		return "", fmt.Errorf("RTSP response headers exceed %d bytes", maxHeaderLen)
+	}
+	var line []byte
+	for {
+		fragment, err := br.ReadSlice('\n')
+		if len(line)+len(fragment) > limit {
+			return "", fmt.Errorf("RTSP response headers exceed %d bytes", maxHeaderLen)
+		}
+		line = append(line, fragment...)
+		if err == nil {
+			return string(line), nil
+		}
+		if err != bufio.ErrBufferFull {
+			return "", err
+		}
+	}
 }
 
 // challenge holds parsed WWW-Authenticate parameters.

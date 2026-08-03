@@ -8,7 +8,7 @@
 
 ```dockerfile
 # ---- build ----
-FROM golang:1.26-alpine AS build
+FROM golang:1.26.5-alpine AS build
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -19,14 +19,23 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}"
 
 # ---- runtime ----
 FROM alpine:3.20
-RUN apk add --no-cache ffmpeg tzdata ca-certificates
+ARG UID=10001
+ARG GID=10001
+RUN apk add --no-cache ffmpeg tzdata ca-certificates \
+    && addgroup -S -g "${GID}" onvif-proxy \
+    && adduser -S -D -H -u "${UID}" -G onvif-proxy onvif-proxy \
+    && mkdir -p /config \
+    && chown onvif-proxy:onvif-proxy /config
 COPY --from=build /out/onvif-proxy /usr/local/bin/onvif-proxy
 VOLUME /config
 EXPOSE 8080
+USER onvif-proxy:onvif-proxy
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["sh", "-ec", "kill -0 1"]
 ENTRYPOINT ["onvif-proxy", "-config", "/config/config.yaml"]
 ```
 
-多架构:`linux/amd64` + `linux/arm64`(树莓派/NAS),用 `docker buildx` + GitHub Actions 发布到 GHCR。
+多架构:`linux/amd64` + `linux/arm64`(树莓派/NAS),用 `docker buildx` + GitHub Actions 发布到 GHCR。构建镜像和 CI 均使用已修复漏洞的 Go 1.26.5 工具链。应用以固定的非 root 用户 `10001:10001` 运行。健康检查探测 PID 1 进程而不是 `/healthz`,因此禁用 Web UI 或开启 Basic 认证时仍然有效。它只表示进程存活,不代表每个 ONVIF/RTSP 监听端口都已就绪。
 
 ### 环境变量
 
@@ -52,7 +61,7 @@ services:
       lan:
         ipv4_address: 192.168.1.99      # 与 config.yaml 的 advertise_ip 一致
     volumes:
-      - ./config:/config
+      - onvif-config:/config
 
 networks:
   lan:
@@ -64,6 +73,9 @@ networks:
         - subnet: 192.168.1.0/24
           gateway: 192.168.1.1
           ip_range: 192.168.1.96/28      # 预留给容器的小段
+
+volumes:
+  onvif-config:
 ```
 
 注意:macvlan 下**宿主机自身默认无法访问容器 IP**(内核限制),管理 UI 从局域网其他机器访问,或另加 macvlan shim 接口。
@@ -77,10 +89,13 @@ services:
     network_mode: host
     restart: unless-stopped
     volumes:
-      - ./config:/config
+      - onvif-config:/config
     environment:                         # 可选:env 覆盖全局配置(见 docs/03 §3)
       ONVIF_WEB_USERNAME: admin
       ONVIF_WEB_PASSWORD: ${WEB_PASSWORD}
+
+volumes:
+  onvif-config:
 ```
 
 组播可用;所有端口直接占宿主机,注意规划避免冲突。compose.yaml 里同一位置还留了一份被注释的 `ONVIF_WEB_PORT` 覆盖示例(改 Web UI 监听端口),按需取消注释即可,无需改 config.yaml。
@@ -96,16 +111,28 @@ services:
 
 ## 4. 升级与数据
 
-- 唯一持久化数据 = `/config/config.yaml`(含自动生成的 uuid/mac);
+- 唯一持久化数据 = `/config/config.yaml`(含自动生成的 uuid/mac)。默认的 `onvif-config` named volume 会继承镜像中的非 root 所有权,空 volume 首次启动时无需额外配置权限即可生成配置;
 - 升级 = 换镜像重启;uuid/mac 持久化保证客户端不会把设备认成新机器;
-- 备份 = 备份该 YAML 一个文件。
+- 备份 = 备份该 YAML 一个文件,例如:`docker cp onvif-proxy:/config/config.yaml ./config.yaml`;
+- 如需直接在宿主机编辑配置,可以改用 bind mount,并让容器使用宿主机 UID/GID,以保证配置的原子重写仍可用:
+
+  ```bash
+  mkdir -p config
+  docker run -d --name onvif-proxy --network host \
+    --user "$(id -u):$(id -g)" \
+    -v "$(pwd)/config:/config" \
+    ghcr.io/aiaid/onvif-proxy:latest
+  ```
+
+  也可以保持镜像默认用户,将 bind 目录授权给 UID/GID `10001:10001`。不要把目录设为全员可写,其中可能包含上游摄像机凭证。
 
 ## 5. CI/CD(GitHub Actions,已实现:`.github/workflows/docker-publish.yml`)
 
-- **PR** → `go vet` + `go test -race`(只测不构建);
+- **PR** → UI 类型/构建检查 + bundle 新旧检查 + `go vet` + `go test -race` + `govulncheck`(只测试,不发布镜像);
 - **push main / tag v\* / 手动** → test → amd64 + arm64 **原生 runner** 并行构建(push-by-digest 到 GHCR,gha 缓存)→ merge job 合并 manifest list;
 - 镜像目标:`ghcr.io/aiaid/onvif-proxy`(`GITHUB_TOKEN`,永远可用);仓库配置了 `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets 时,同一组 tag 自动镜像到 Docker Hub `<user>/onvif-proxy`(imagetools 跨仓库复制 blob,无需二次构建);
-- tag 规则:分支名、`v*` 版本(+semver)、短 sha、main 上的 `latest`;`VERSION` build-arg 注入二进制(tag 名或短 sha)。
+- tag 规则:分支名、`v*` 版本(+semver)、短 sha、main 上的 `latest`;`VERSION` build-arg 注入二进制(tag 名或短 sha);
+- workflow 默认只有仓库只读权限,仅发布 job 获得 `packages: write`,第三方 actions 均固定到已核验的 commit SHA。
 
 ## 6. 裸机运行(不走 Docker)
 

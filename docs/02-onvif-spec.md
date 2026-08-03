@@ -48,9 +48,10 @@ Fault message structure (SOAP 1.2 §5.4): `Code/Subcode/Reason/Detail` all prese
 
 - Implements **PasswordDigest** verification per the OASIS UsernameToken Profile:
   `Digest = Base64( SHA-1( Base64Decode(Nonce) + Created + Password ) )`
-- `Created` timestamp tolerance is ±5 minutes (a compile-time hardcoded constant, not currently configurable); replay-protection nonce caching is deliberately skipped for now (LAN scenario, complexity trade-off).
+- PasswordDigest requires a valid Base64 `Nonce` and a parseable `Created`; the timestamp tolerance is ±5 minutes (a compile-time hardcoded constant, not currently configurable). Successfully verified nonce/timestamp pairs are cached for the skew window and rejected on replay.
 - **`GetSystemDateAndTime` is always unauthenticated** (the Core Spec explicitly requires this: the client needs it to sync its clock before it can compute a valid Digest).
 - Per-device `auth.username/password` is configurable; if not configured, **everything is allowed through** (any/missing WSSE header is accepted) — consistent with upstream behavior, for convenience on internal networks.
+- When device auth is configured, the HTTP snapshot URL returned by `GetSnapshotUri` requires the same username/password via HTTP Basic. Basic credentials are not encrypted on plain HTTP, so use this only on a trusted network or behind a TLS reverse proxy.
 - PasswordText mode is accepted as well (some clients only send plaintext).
 
 ## 3. WS-Discovery
@@ -110,12 +111,12 @@ Data model (**multi-Profile**, count determined by the configured `streams[]`, N
 | CreateProfile / DeleteProfile | ✗ | ActionNotSupported (Profiles are fixed) |
 | GetVideoSources | ✅ | Resolution/frame rate taken from the primary stream's (streams[0]) configuration |
 | GetVideoSourceConfigurations / ~Configuration | ✅ | Bounds = full frame |
-| GetVideoEncoderConfigurations / ~Configuration | ✅ | H264 (H265 pass-through declaration configurable), resolution/frame rate/bitrate/GOP per stream from config |
-| GetVideoEncoderConfigurationOptions | ✅ | Only lists the resolution tiers of each configured stream (a virtual device can't actually change the encoding) |
+| GetVideoEncoderConfigurations / ~Configuration | ✅ | Per-stream H264, JPEG, or MPEG4 `Encoding` and matching codec-specific node; resolution/frame rate/bitrate/GOP come from config. Profile S does not define H.265, so H.265/HEVC configs are rejected |
+| GetVideoEncoderConfigurationOptions | ✅ | Lists only configured codec groups and their resolution/frame-rate tiers; when a configuration/profile token is supplied, options are restricted to that stream |
 | SetVideoEncoderConfiguration | ◽ | Accepted and ignored (returns an empty success; onboarding flows on clients often call this) |
 | GetStreamUri | ✅ | `rtsp://<ip>:<that stream's proxy port>/<original path>`; looks up the corresponding stream by ProfileToken |
-| GetSnapshotUri | ✅ | `http://<ip>:<soapPort>/onvif/snapshot?token=<profile>`; two backend modes: pass-through of the real camera's snapshot URL, or ffmpeg frame capture (with TTL cache), see the `snapshot` section of doc 03 |
-| GetGuaranteedNumberOfVideoEncoderInstances | ✅ | `TotalNumber`/`H264` both equal the configured stream count |
+| GetSnapshotUri | ✅ | `http://<ip>:<soapPort>/onvif/snapshot?token=<profile>`; when device `auth` is configured the URL requires HTTP Basic with the same credentials. Two backend modes: pass-through of the real camera's snapshot URL, or ffmpeg frame capture (with TTL cache), see the `snapshot` section of doc 03 |
+| GetGuaranteedNumberOfVideoEncoderInstances | ✅ | `TotalNumber` is the stream count; optional `JPEG`/`H264`/`MPEG4` counts reflect configured codecs |
 | GetAudioSources / GetAudioEncoderConfigurations and other audio-related methods | ◽ | Empty list (a valid response declaring no audio) |
 | GetCompatibleVideoSourceConfigurations / GetCompatibleVideoEncoderConfigurations and other Compatible-type methods | ✅ | Share the rendering function with the corresponding Get~Configuration(s), returning the same fixed configuration |
 | GetOSDs | ◽ | Empty list |

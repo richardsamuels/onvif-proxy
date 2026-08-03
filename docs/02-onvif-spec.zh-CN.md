@@ -48,9 +48,10 @@ Fault 报文结构(SOAP 1.2 §5.4):`Code/Subcode/Reason/Detail` 齐全,`Reason` 
 
 - 实现 OASIS UsernameToken Profile 的 **PasswordDigest** 校验:
   `Digest = Base64( SHA-1( Base64Decode(Nonce) + Created + Password ) )`
-- `Created` 时间偏差容忍 ±5 分钟(编译期硬编码常量,当前不支持配置修改),防重放的 nonce 缓存暂不做(局域网场景,权衡复杂度)。
+- PasswordDigest 强制要求合法 Base64 `Nonce` 与可解析的 `Created`;时间偏差容忍 ±5 分钟(编译期硬编码常量,当前不支持配置修改)。通过校验的 nonce/时间戳组合会在偏差窗口内缓存,重复使用将被拒绝。
 - **`GetSystemDateAndTime` 永远免认证**(Core Spec 明确要求:客户端靠它校时后才能算出合法 Digest)。
 - 每设备可配置 `auth.username/password`;不配置则**全放行**(接受任意/缺失 WSSE 头)—— 与上游行为一致,便于内网使用。
+- 配置设备认证后,`GetSnapshotUri` 返回的 HTTP 快照地址也要求使用同一组账号密码进行 HTTP Basic 认证。明文 HTTP 上的 Basic 凭证不加密,仅应在可信网络使用,或置于 TLS 反向代理之后。
 - PasswordText 模式一并接受(部分客户端只发明文)。
 
 ## 3. WS-Discovery
@@ -110,12 +111,12 @@ Fault 报文结构(SOAP 1.2 §5.4):`Code/Subcode/Reason/Detail` 齐全,`Reason` 
 | CreateProfile / DeleteProfile | ✗ | ActionNotSupported(Profile 固定) |
 | GetVideoSources | ✅ | 分辨率/帧率取主流(streams[0])配置 |
 | GetVideoSourceConfigurations / ~Configuration | ✅ | Bounds = 完整画面 |
-| GetVideoEncoderConfigurations / ~Configuration | ✅ | H264(可配 H265 直通声明),分辨率/帧率/码率/GOP 逐流来自配置 |
-| GetVideoEncoderConfigurationOptions | ✅ | 仅列出配置中各流的分辨率档位(虚拟设备不可真正改编码) |
+| GetVideoEncoderConfigurations / ~Configuration | ✅ | 逐流输出 H264、JPEG 或 MPEG4 `Encoding` 与对应编码专属节点;分辨率/帧率/码率/GOP 来自配置。Profile S 未定义 H.265,因此拒绝 H.265/HEVC 配置 |
+| GetVideoEncoderConfigurationOptions | ✅ | 仅列出已配置编码及其分辨率/帧率档位;提供 configuration/profile token 时只返回该流的选项 |
 | SetVideoEncoderConfiguration | ◽ | 接受并忽略(返回空成功;客户端收编流程常会调用) |
 | GetStreamUri | ✅ | `rtsp://<ip>:<该流代理端口>/<原始path>`;按 ProfileToken 找到对应流 |
-| GetSnapshotUri | ✅ | `http://<ip>:<soapPort>/onvif/snapshot?token=<profile>`;后端两种模式:真实摄像头快照 URL 透传,或 ffmpeg 抓帧(带 TTL 缓存),见 03 文档 `snapshot` 节 |
-| GetGuaranteedNumberOfVideoEncoderInstances | ✅ | `TotalNumber`/`H264` 均等于配置的流数量 |
+| GetSnapshotUri | ✅ | `http://<ip>:<soapPort>/onvif/snapshot?token=<profile>`;配置设备 `auth` 后需用同一组凭证进行 HTTP Basic 认证。后端两种模式:真实摄像头快照 URL 透传,或 ffmpeg 抓帧(带 TTL 缓存),见 03 文档 `snapshot` 节 |
+| GetGuaranteedNumberOfVideoEncoderInstances | ✅ | `TotalNumber` 为流数量;可选 `JPEG`/`H264`/`MPEG4` 计数按配置编码统计 |
 | GetAudioSources / GetAudioEncoderConfigurations 等音频类 | ◽ | 空列表(合法响应,声明无音频) |
 | GetCompatibleVideoSourceConfigurations / GetCompatibleVideoEncoderConfigurations 等 Compatible 类 | ✅ | 与对应 Get~Configuration(s) 共用渲染函数,返回同一固定配置 |
 | GetOSDs | ◽ | 空列表 |

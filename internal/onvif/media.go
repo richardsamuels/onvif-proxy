@@ -11,7 +11,7 @@ import (
 
 // handleMedia dispatches POST /onvif/media_service.
 func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
-	req, err := parse(r)
+	req, err := parse(w, r)
 	if err != nil {
 		soap.WriteInvalidArg(w, "malformed SOAP request")
 		return
@@ -43,7 +43,7 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	case "GetVideoEncoderConfiguration":
 		s.getVideoEncoderConfiguration(w, req)
 	case "GetVideoEncoderConfigurationOptions":
-		write(w, s.videoEncoderConfigurationOptions())
+		s.getVideoEncoderConfigurationOptions(w, req)
 	case "SetVideoEncoderConfiguration":
 		write(w, "<trt:SetVideoEncoderConfigurationResponse/>")
 	case "GetStreamUri":
@@ -98,10 +98,19 @@ func videoEncoderConfig(tag string, st *config.Stream) string {
 	if gov < 1 {
 		gov = 1
 	}
+	codecNode := ""
+	switch st.CodecName() {
+	case "jpeg":
+		// JPEG has no codec-specific configuration node in tt:VideoEncoderConfiguration.
+	case "mpeg4":
+		codecNode = fmt.Sprintf("<tt:MPEG4><tt:GovLength>%d</tt:GovLength><tt:Mpeg4Profile>SP</tt:Mpeg4Profile></tt:MPEG4>", gov)
+	default:
+		codecNode = fmt.Sprintf("<tt:H264><tt:GovLength>%d</tt:GovLength><tt:H264Profile>Main</tt:H264Profile></tt:H264>", gov)
+	}
 	return fmt.Sprintf("<tt:%s token=\"%s\">", tag, soap.XMLEscape(st.EncoderToken())) +
 		"<tt:Name>" + soap.XMLEscape(st.EncoderToken()) + "</tt:Name>" +
 		"<tt:UseCount>1</tt:UseCount>" +
-		"<tt:Encoding>H264</tt:Encoding>" +
+		"<tt:Encoding>" + encoderName(st) + "</tt:Encoding>" +
 		fmt.Sprintf("<tt:Resolution><tt:Width>%d</tt:Width><tt:Height>%d</tt:Height></tt:Resolution>", st.Width, st.Height) +
 		"<tt:Quality>5</tt:Quality>" +
 		"<tt:RateControl>" +
@@ -109,10 +118,21 @@ func videoEncoderConfig(tag string, st *config.Stream) string {
 		"<tt:EncodingInterval>1</tt:EncodingInterval>" +
 		fmt.Sprintf("<tt:BitrateLimit>%d</tt:BitrateLimit>", st.Bitrate) +
 		"</tt:RateControl>" +
-		fmt.Sprintf("<tt:H264><tt:GovLength>%d</tt:GovLength><tt:H264Profile>Main</tt:H264Profile></tt:H264>", gov) +
+		codecNode +
 		"<tt:Multicast><tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address><tt:Port>0</tt:Port><tt:TTL>1</tt:TTL><tt:AutoStart>false</tt:AutoStart></tt:Multicast>" +
 		"<tt:SessionTimeout>PT10S</tt:SessionTimeout>" +
 		fmt.Sprintf("</tt:%s>", tag)
+}
+
+func encoderName(st *config.Stream) string {
+	switch st.CodecName() {
+	case "jpeg":
+		return "JPEG"
+	case "mpeg4":
+		return "MPEG4"
+	default:
+		return "H264"
+	}
 }
 
 // profileBody renders the inner nodes (Name, VSC, VEC) shared by GetProfiles
@@ -188,11 +208,58 @@ func (s *Server) getVideoEncoderConfiguration(w http.ResponseWriter, req *soap.R
 	soap.WriteInvalidArg(w, "no such configuration: "+token)
 }
 
-func (s *Server) videoEncoderConfigurationOptions() string {
+func (s *Server) getVideoEncoderConfigurationOptions(w http.ResponseWriter, req *soap.Request) {
+	streams := s.dev.Streams
+	if token, ok := soap.ExtractElement(req.Body, "ConfigurationToken"); ok && token != "" {
+		streams = nil
+		for _, st := range s.dev.Streams {
+			if st.EncoderToken() == token {
+				streams = []*config.Stream{st}
+				break
+			}
+		}
+		if len(streams) == 0 {
+			soap.WriteInvalidArg(w, "no such configuration: "+token)
+			return
+		}
+	} else if token, ok := soap.ExtractElement(req.Body, "ProfileToken"); ok && token != "" {
+		st := s.dev.StreamByProfileToken(token)
+		if st == nil {
+			soap.WriteInvalidArg(w, "no such profile: "+token)
+			return
+		}
+		streams = []*config.Stream{st}
+	}
+	write(w, videoEncoderConfigurationOptions(streams))
+}
+
+func videoEncoderConfigurationOptions(streams []*config.Stream) string {
+	grouped := map[string][]*config.Stream{}
+	for _, st := range streams {
+		grouped[st.CodecName()] = append(grouped[st.CodecName()], st)
+	}
+	var options strings.Builder
+	for _, codec := range []string{"jpeg", "mpeg4", "h264"} {
+		if streams := grouped[codec]; len(streams) > 0 {
+			options.WriteString(videoEncoderCodecOptions(codec, streams))
+		}
+	}
+	return "<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options>" +
+		"<tt:QualityRange><tt:Min>1</tt:Min><tt:Max>10</tt:Max></tt:QualityRange>" +
+		options.String() +
+		"</trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>"
+}
+
+func videoEncoderCodecOptions(codec string, streams []*config.Stream) string {
 	var res strings.Builder
 	maxFR := 0
-	for _, st := range s.dev.Streams {
-		res.WriteString(fmt.Sprintf("<tt:ResolutionsAvailable><tt:Width>%d</tt:Width><tt:Height>%d</tt:Height></tt:ResolutionsAvailable>", st.Width, st.Height))
+	seenResolutions := map[[2]int]bool{}
+	for _, st := range streams {
+		size := [2]int{st.Width, st.Height}
+		if !seenResolutions[size] {
+			seenResolutions[size] = true
+			res.WriteString(fmt.Sprintf("<tt:ResolutionsAvailable><tt:Width>%d</tt:Width><tt:Height>%d</tt:Height></tt:ResolutionsAvailable>", st.Width, st.Height))
+		}
 		if st.Framerate > maxFR {
 			maxFR = st.Framerate
 		}
@@ -200,23 +267,43 @@ func (s *Server) videoEncoderConfigurationOptions() string {
 	if maxFR < 1 {
 		maxFR = 30
 	}
-	return "<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options>" +
-		"<tt:QualityRange><tt:Min>1</tt:Min><tt:Max>10</tt:Max></tt:QualityRange>" +
-		"<tt:H264>" +
-		res.String() +
-		"<tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>250</tt:Max></tt:GovLengthRange>" +
-		fmt.Sprintf("<tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>%d</tt:Max></tt:FrameRateRange>", maxFR) +
-		"<tt:EncodingIntervalRange><tt:Min>1</tt:Min><tt:Max>1</tt:Max></tt:EncodingIntervalRange>" +
-		"<tt:H264ProfilesSupported>Main</tt:H264ProfilesSupported>" +
-		"</tt:H264>" +
-		"</trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>"
+	ranges := fmt.Sprintf("<tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>%d</tt:Max></tt:FrameRateRange>", maxFR) +
+		"<tt:EncodingIntervalRange><tt:Min>1</tt:Min><tt:Max>1</tt:Max></tt:EncodingIntervalRange>"
+	switch codec {
+	case "jpeg":
+		return "<tt:JPEG>" + res.String() + ranges + "</tt:JPEG>"
+	case "mpeg4":
+		return "<tt:MPEG4>" +
+			res.String() +
+			"<tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>250</tt:Max></tt:GovLengthRange>" +
+			ranges +
+			"<tt:Mpeg4ProfilesSupported>SP</tt:Mpeg4ProfilesSupported>" +
+			"</tt:MPEG4>"
+	default:
+		return "<tt:H264>" +
+			res.String() +
+			"<tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>250</tt:Max></tt:GovLengthRange>" +
+			ranges +
+			"<tt:H264ProfilesSupported>Main</tt:H264ProfilesSupported>" +
+			"</tt:H264>"
+	}
 }
 
 func (s *Server) guaranteedInstances() string {
-	return "<trt:GetGuaranteedNumberOfVideoEncoderInstancesResponse>" +
-		fmt.Sprintf("<trt:TotalNumber>%d</trt:TotalNumber>", len(s.dev.Streams)) +
-		fmt.Sprintf("<trt:H264>%d</trt:H264>", len(s.dev.Streams)) +
-		"</trt:GetGuaranteedNumberOfVideoEncoderInstancesResponse>"
+	counts := map[string]int{}
+	for _, st := range s.dev.Streams {
+		counts[encoderName(st)]++
+	}
+	var body strings.Builder
+	body.WriteString("<trt:GetGuaranteedNumberOfVideoEncoderInstancesResponse>")
+	body.WriteString(fmt.Sprintf("<trt:TotalNumber>%d</trt:TotalNumber>", len(s.dev.Streams)))
+	for _, codec := range []string{"JPEG", "H264", "MPEG4"} {
+		if count := counts[codec]; count > 0 {
+			body.WriteString(fmt.Sprintf("<trt:%s>%d</trt:%s>", codec, count, codec))
+		}
+	}
+	body.WriteString("</trt:GetGuaranteedNumberOfVideoEncoderInstancesResponse>")
+	return body.String()
 }
 
 func mediaURIBody(responseTag, uri string) string {

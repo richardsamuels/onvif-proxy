@@ -85,8 +85,13 @@ Snapshot results are cached in memory with a short TTL (10s by default), to avoi
 ```
 UI save ──PUT /api/config──▶ validation (YAML syntax + port conflicts + field validity)
   ├─ validation fails → 400 + error detail, nothing written to disk
-  └─ validation succeeds → atomically write config.yaml → Manager.Reload()
-                  └─ stop old Virtual Devices → start new Virtual Devices → WS-Discovery updates device table (Bye/Hello)
+  └─ validation succeeds → Manager.ApplyConfig()
+                  ├─ stop old Virtual Devices
+                  ├─ pre-bind every candidate SOAP/RTSP listener
+                  ├─ bind/start Discovery when enabling it
+                  ├─ any failure → restart the previous generation; disk remains unchanged
+                  └─ success → publish runtime → fsync + atomic rename config.yaml
+                                      → WS-Discovery updates metadata (Bye/Hello)
 ```
 
 ### 3.4 MCP Tool Invocation
@@ -149,12 +154,13 @@ onvif-proxy/
 ## 6. Concurrency and Lifecycle
 
 - Each Virtual Device's HTTP server and RTSP proxy run in their own goroutine; `Manager` uses a `context` tree for unified cancellation.
-- Hot reload semantics: **stop-then-start** (stop everything, then start everything). With a small number of devices (single digits to a few dozen), the interruption is < 1s, trading that off for a simpler implementation with no port-occupancy race.
+- Hot reload semantics: **transactional stop-then-start**. Config mutations are serialized; the old generation stops, every candidate SOAP/RTSP port is synchronously pre-bound, and only a fully started candidate is atomically persisted. A bind/start/write failure restores the previous generation and leaves the old file intact. Device status reflects listener failures instead of reporting every configured device as running.
+- `server.advertise_ip`, Discovery metadata and the Discovery enable switch reload live. Web credentials reload live through request-time auth lookup; listener-affecting `web.enabled`/`web.port` changes are rejected with a restart-required error instead of pretending to apply.
 - ffmpeg child process lifetime is bound to the HTTP request lifetime: client disconnects → context cancelled → process group killed, leaving no zombies.
 - Graceful shutdown: SIGTERM → WS-Discovery sends Bye → all listeners closed → in-flight requests awaited (5s timeout).
 
 ## 7. Non-Goals (explicitly out of scope)
 
 - PTZ, audio backchannel, Events/doorbell, ONVIF Profile T/G/M — Profile S live streaming + snapshot already satisfies Unifi Protect adoption requirements.
-- RTSP re-muxing/transcoding — the stream the client receives is exactly the real camera's stream; whether H.265 works is up to the client itself.
+- RTSP re-muxing/transcoding — the stream the client receives is exactly the real camera's stream. The TCP proxy is codec-agnostic, but this Profile S implementation intentionally rejects H.265/HEVC configurations because Profile S has no H.265 encoder type.
 - Multi-node/cluster — single process, single config file.

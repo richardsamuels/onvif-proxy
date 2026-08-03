@@ -12,7 +12,9 @@
 type Config struct { Server ServerConfig; Web WebConfig; Devices []*Device }
 func Load(path string) (*Config, error)          // 读+校验+生成 uuid/mac 并写回
 func Parse(data []byte) (*Config, error)         // 严格解析+校验(dry-run 用)
+func Prepare(data []byte) (*Config, []byte, error) // 解析+校验+生成身份,返回规范 YAML 且不落盘
 func Save(path string, cfg *Config) error        // 原子写
+func WriteDefault(path string) error             // 以 0600 权限排他创建初始配置
 func ApplyEnvOverrides(cfg *Config) ([]string, error) // ONVIF_* env 覆盖(仅内存,覆盖后重校验);返回已应用项供日志
 func DetectAdvertiseIP() string
 
@@ -26,7 +28,8 @@ func (d *Device) ProxyBindings() []ProxyBinding  // {ListenPort int; Target stri
 func (d *Device) SnapshotStream() *Stream
 func (d *Device) SnapshotCacheSeconds() int
 
-type Stream struct { Name, RTSP string; Width, Height, Framerate, Bitrate, ProxyPort int }
+type Stream struct { Name, RTSP, Codec string; Width, Height, Framerate, Bitrate, ProxyPort int }
+func (s *Stream) CodecName() string // 规范化 h264(默认)、jpeg 或 mpeg4
 func (s *Stream) TargetAddr() string             // "host:port"(默认 554)
 func (s *Stream) PathQuery() string              // "/path?query"
 func (s *Stream) SourceURL() string              // 含凭证的完整上游 URL
@@ -85,14 +88,15 @@ type Options struct {
 
 func NewServer(dev *config.Device, opts Options) *Server
 func (s *Server) Run(ctx context.Context) error // 监听 dev.Ports.SOAP,ctx 取消时优雅退出
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error // 在已绑定 listener 上服务
 
 // 路由:
 //   POST /onvif/device_service
 //   POST /onvif/media_service
-//   GET  /onvif/snapshot?token=<profileToken>   (免 WSSE;调 SnapshotFunc)
+//   GET  /onvif/snapshot?token=<profileToken>   (配置 dev.Auth 时要求 HTTP Basic)
 ```
 
-行为要求(细节见 docs/02):方法矩阵按 02 文档第 4/5 节;`GetSystemDateAndTime` 免认证;`dev.Auth == nil` 全放行;URI 构造优先 `r.Host`;未知方法 → `soap.WriteActionNotSupported`。
+行为要求(细节见 docs/02):方法矩阵按 02 文档第 4/5 节;`GetSystemDateAndTime` 免认证;`dev.Auth == nil` 全放行;PasswordDigest 要求有效且新鲜的时间戳/nonce,并拒绝 nonce 重放;URI 构造优先 `r.Host`;未知方法 → `soap.WriteActionNotSupported`。SOAP 请求体上限 1 MiB,HTTP server 设置 header/read/idle 超时上限。
 
 ## internal/discovery(WS-Discovery)
 
@@ -104,7 +108,9 @@ type LogEntry struct { Time time.Time; Remote, Kind, Detail string } // Kind: pr
 
 func New(devices []Device) *Server
 func (s *Server) Run(ctx context.Context) error  // 绑定 :3702、加组播、Hello;ctx 取消时发 Bye
-func (s *Server) SetDevices(devices []Device)    // 热重载:对差集发 Bye/Hello
+func Listen() (*net.UDPConn, *net.UDPAddr, error) // 同步绑定并加入组播
+func (s *Server) Serve(ctx context.Context, conn *net.UDPConn, addr *net.UDPAddr) error
+func (s *Server) SetDevices(devices []Device)    // 热重载:删除、新增或元数据变化均发 Bye/Hello
 func (s *Server) Log() []LogEntry                // 最近 50 条,新在前
 ```
 
@@ -114,8 +120,10 @@ func (s *Server) Log() []LogEntry                // 最近 50 条,新在前
 package rtspproxy
 
 // 监听 127.0.0.1 之外全接口的 listenPort,双向 io.Copy 到 target("host:port")。
-// ctx 取消时关闭 listener 与全部在途连接。返回 net.Listen 错误或 ctx.Err()。
+// ctx 取消时关闭 listener 与全部在途连接;每个代理最多 128 个活动连接,并执行
+// 全双工共享空闲超时。
 func Run(ctx context.Context, listenPort int, target string) error
+func Serve(ctx context.Context, ln net.Listener, target string) error
 ```
 
 ## internal/rtsp(原生 RTSP 探测客户端)
@@ -153,6 +161,7 @@ func Probe(ctx context.Context, rawURL string) *Result
 package mediautil
 
 func Available() bool // PATH 中是否有 ffmpeg
+func ProbeAvailable() bool // PATH 中是否有 ffprobe
 
 // 抓单帧 JPEG:-rtsp_transport tcp -frames:v 1;stderr 摘要进 error
 func Grab(ctx context.Context, rtspURL string) ([]byte, error)
@@ -196,7 +205,7 @@ type Backend interface {
     DiscoveryLog() []discovery.LogEntry
     Status() Status
 }
-type DeviceRuntime struct { Device *config.Device; Running bool }
+type DeviceRuntime struct { Device *config.Device; Running bool; Error string }
 type Status struct {
     Version, AdvertiseIP string
     UptimeSeconds        int64
@@ -205,6 +214,7 @@ type Status struct {
 
 func New(cfg config.WebConfig, backend Backend) *Server
 func (s *Server) Run(ctx context.Context) error
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error // 在已绑定 listener 上服务
 ```
 
 REST 路由与语义见 docs/04(`/api/config`、`/api/devices`、`/api/test/rtsp`、`/api/test/streaminfo`、`/api/test/snapshot`、`/api/preview`、`/api/test/onvif`、`/api/discovery/log`、`/api/status`、`/healthz`)。要点:
@@ -212,8 +222,8 @@ REST 路由与语义见 docs/04(`/api/config`、`/api/devices`、`/api/test/rtsp
 - 探测直接调 `rtsp.Probe`;预览直接调 `mediautil.ServeMJPEG`(每设备并发上限 2,web 层管信号量);快照走 `Backend.Snapshot`(缓存/透传由 main 组合);
 - **ONVIF 自检**在 web 包内实现:对 `dev.Ports.SOAP` 逐方法发手写 SOAP envelope(WSSE 按 dev.Auth 生成),按 docs/04 的方法清单返回 `[{method, http_status, soap_fault, pass}]`;最后加一个不存在的方法,pass 条件 = 返回体是合法 Fault XML 且 subcode 为 ActionNotSupported;
 - 静态 UI:Preact+TSX 源码在 `internal/web/ui/`,esbuild 打包为 `static/dist/{app.js,app.css}`(提交进仓库),`index.html` 薄壳,`go:embed all:static` 进二进制(含 `dist/`);`GET /dist/*` 由 `http.FileServerFS` 从嵌入 FS 服务;`PUT /api/devices/{uuid}` 编辑设备(见 docs/04);`GET /api/devices` DTO 为编辑预填补充了 `rtsp_port/auth_user` 与每流源参数;
-- Basic 认证:cfg.Username 非空时对全部路由生效。
+- Basic 认证:cfg.Username 非空时对全部路由生效;若 backend 同时实现 `WebConfig() config.WebConfig`,每次请求动态读取凭证,用户名/密码变更无需重启 Web listener。
 
 ## cmd/onvif-proxy(main,集成层,最后实现)
 
-职责:flag 解析(`-config`,默认 `./config.yaml`;`-version`)→ `config.Load` → 组装 Manager(实现 `web.Backend`;每设备起 onvif.Server + rtspproxy;discovery.Server;快照函数 = 透传 or mediautil.Grab + Cache)→ 信号处理与热重载(stop-then-start)。
+职责:flag 解析(`-config`,默认 `./config.yaml`;`-version`)→ `config.Load` → 组装 Manager(实现 `web.Backend`;每设备起 onvif.Server + rtspproxy;discovery.Server;快照函数 = 透传 or mediautil.Grab + Cache)→ 信号处理与事务式热重载。重载先准备候选配置并同步预绑定全部 SOAP/RTSP/discovery listener;绑定或落盘失败会恢复旧 generation,保留可用的旧运行态与旧文件;成功时用同目录原子 rename 且权限为 0600。`web.username/password` 可热更新,`web.enabled` 或 `web.port` 变更则明确要求重启。

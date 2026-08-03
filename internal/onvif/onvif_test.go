@@ -2,9 +2,11 @@ package onvif
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/xml"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -69,6 +71,9 @@ func soapEnv(header, body string) string {
 
 func wsseHeader(user, password string) string {
 	nonceRaw := []byte("0123456789abcdef")
+	if _, err := crand.Read(nonceRaw); err != nil {
+		panic(err)
+	}
 	created := time.Now().UTC().Format(time.RFC3339)
 	h := sha1.New()
 	h.Write(nonceRaw)
@@ -160,6 +165,50 @@ func TestBadWSSEReturns400(t *testing.T) {
 	}
 }
 
+func TestWSSENonceReplayReturns400(t *testing.T) {
+	s := testServer(t)
+	env := soapEnv(wsseHeader("admin", "secret"), "<tds:GetDeviceInformation/>")
+	if rec := post(t, s, "/onvif/device_service", env); rec.Code != 200 {
+		t.Fatalf("first request status = %d, want 200\n%s", rec.Code, rec.Body)
+	}
+	rec := post(t, s, "/onvif/device_service", env)
+	if rec.Code != 400 {
+		t.Fatalf("replayed request status = %d, want 400\n%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "NotAuthorized") {
+		t.Errorf("replay fault missing NotAuthorized:\n%s", rec.Body)
+	}
+}
+
+func TestSOAPBodyLimitReturnsFault(t *testing.T) {
+	s := testServer(t)
+	body := strings.Repeat("x", maxSOAPBodyBytes+1)
+	rec := post(t, s, "/onvif/device_service", body)
+	if rec.Code != 400 {
+		t.Fatalf("status = %d, want 400\n%s", rec.Code, rec.Body)
+	}
+	assertValidXML(t, rec.Body.Bytes())
+	if !strings.Contains(rec.Body.String(), "InvalidArgVal") {
+		t.Errorf("oversized request missing InvalidArgVal:\n%s", rec.Body)
+	}
+}
+
+func TestHTTPServerResourceLimits(t *testing.T) {
+	srv := testServer(t).httpServer()
+	if srv.ReadHeaderTimeout != readHeaderTimeout {
+		t.Errorf("ReadHeaderTimeout = %s, want %s", srv.ReadHeaderTimeout, readHeaderTimeout)
+	}
+	if srv.ReadTimeout != readTimeout {
+		t.Errorf("ReadTimeout = %s, want %s", srv.ReadTimeout, readTimeout)
+	}
+	if srv.IdleTimeout != idleTimeout {
+		t.Errorf("IdleTimeout = %s, want %s", srv.IdleTimeout, idleTimeout)
+	}
+	if srv.MaxHeaderBytes != maxHeaderBytes {
+		t.Errorf("MaxHeaderBytes = %d, want %d", srv.MaxHeaderBytes, maxHeaderBytes)
+	}
+}
+
 func TestGetDeviceInformationValidAuth(t *testing.T) {
 	s := testServer(t)
 	env := soapEnv(wsseHeader("admin", "secret"), "<tds:GetDeviceInformation/>")
@@ -221,11 +270,45 @@ func TestGetSnapshotUriAndEndpoint(t *testing.T) {
 	snap := httptest.NewRequest("GET", "/onvif/snapshot?token=profile_main", nil)
 	snapRec := httptest.NewRecorder()
 	s.mux.ServeHTTP(snapRec, snap)
+	if snapRec.Code != 401 {
+		t.Fatalf("unauthenticated snapshot status = %d, want 401", snapRec.Code)
+	}
+	if got := snapRec.Header().Get("WWW-Authenticate"); !strings.HasPrefix(got, "Basic ") {
+		t.Errorf("WWW-Authenticate = %q, want Basic challenge", got)
+	}
+
+	snap = httptest.NewRequest("GET", "/onvif/snapshot?token=profile_main", nil)
+	snap.SetBasicAuth("admin", "wrong")
+	snapRec = httptest.NewRecorder()
+	s.mux.ServeHTTP(snapRec, snap)
+	if snapRec.Code != 401 {
+		t.Fatalf("wrong-password snapshot status = %d, want 401", snapRec.Code)
+	}
+
+	snap = httptest.NewRequest("GET", "/onvif/snapshot?token=profile_main", nil)
+	snap.SetBasicAuth("admin", "secret")
+	snapRec = httptest.NewRecorder()
+	s.mux.ServeHTTP(snapRec, snap)
 	if snapRec.Code != 200 {
-		t.Fatalf("snapshot endpoint status = %d", snapRec.Code)
+		t.Fatalf("authenticated snapshot endpoint status = %d", snapRec.Code)
 	}
 	if snapRec.Body.String() != "JPEGDATA" {
 		t.Errorf("snapshot body = %q", snapRec.Body.String())
+	}
+}
+
+func TestSnapshotWithoutDeviceAuthRemainsAccessible(t *testing.T) {
+	s := testServer(t)
+	s.dev.Auth = nil
+	s.opts.SnapshotFunc = func(context.Context, string) ([]byte, string, error) {
+		return []byte("JPEGDATA"), "image/jpeg", nil
+	}
+
+	req := httptest.NewRequest("GET", "/onvif/snapshot?token=profile_main", nil)
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("snapshot status = %d, want 200", rec.Code)
 	}
 }
 

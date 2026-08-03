@@ -12,7 +12,7 @@ import (
 
 // handleDevice dispatches POST /onvif/device_service.
 func (s *Server) handleDevice(w http.ResponseWriter, r *http.Request) {
-	req, err := parse(r)
+	req, err := parse(w, r)
 	if err != nil {
 		soap.WriteInvalidArg(w, "malformed SOAP request")
 		return

@@ -127,6 +127,72 @@ func TestRun_CancelClosesConnections(t *testing.T) {
 	}
 }
 
+func TestActivityConnReadDeadline(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	conn, _ := withIdleTimeout(left, right, 30*time.Millisecond)
+	start := time.Now()
+	_, err := conn.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("Read succeeded, want idle timeout")
+	}
+	if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("Read error = %v, want timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("idle timeout took too long: %s", elapsed)
+	}
+}
+
+func TestActivityInEitherDirectionRefreshesSharedDeadline(t *testing.T) {
+	clientProxy, clientRemote := net.Pipe()
+	upstreamProxy, upstreamRemote := net.Pipe()
+	defer clientProxy.Close()
+	defer clientRemote.Close()
+	defer upstreamProxy.Close()
+	defer upstreamRemote.Close()
+
+	const timeout = 100 * time.Millisecond
+	client, upstream := withIdleTimeout(clientProxy, upstreamProxy, timeout)
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := client.Read(make([]byte, 1))
+		readDone <- err
+	}()
+
+	// Keep the upstream half active for several idle windows. That activity
+	// must also refresh the blocked client-side read.
+	for range 4 {
+		writeDone := make(chan error, 1)
+		go func() {
+			_, err := upstreamRemote.Write([]byte("x"))
+			writeDone <- err
+		}()
+		if _, err := upstream.Read(make([]byte, 1)); err != nil {
+			t.Fatalf("upstream activity read: %v", err)
+		}
+		if err := <-writeDone; err != nil {
+			t.Fatalf("upstream activity write: %v", err)
+		}
+		select {
+		case err := <-readDone:
+			t.Fatalf("client read timed out despite upstream activity: %v", err)
+		case <-time.After(timeout / 4):
+		}
+	}
+
+	select {
+	case err := <-readDone:
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			t.Fatalf("client read error = %v, want timeout after activity stopped", err)
+		}
+	case <-time.After(3 * timeout):
+		t.Fatal("client read did not time out after all activity stopped")
+	}
+}
+
 func dialWithRetry(t *testing.T, addr string) net.Conn {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

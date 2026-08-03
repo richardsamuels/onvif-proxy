@@ -23,11 +23,12 @@ Desktop 等),使其可以直接管理本代理:例如"帮我把这个 RTSP 流�
   作为约束被破坏的证据。
 - 传输:Streamable HTTP,单端点 `/mcp`,挂在现有 Web UI 的 mux 上
   (与 REST API 同端口),**无状态模式**(`Stateless: true`,不签发
-  `Mcp-Session-Id`)。协议版本协商、405/会话/SSE 细节全部由 SDK 处理。
+  `Mcp-Session-Id`)。协议版本协商、405/会话/SSE 细节全部由 SDK 处理;
+  请求体上限为 1 MiB。
 - 认证:复用 `withAuth` —— 配置了 `web.username` 时全站 Basic 认证,`/mcp`
   自动被覆盖。
 - Go 版本:SDK 要求 Go ≥ 1.25,go.mod 与 Dockerfile 构建镜像同步上调
-  (`golang:1.26-alpine`,见 docs/05)。
+  (`golang:1.26.5-alpine`,见 docs/05)。
 
 客户端接入示例:
 
@@ -62,10 +63,10 @@ schema 由 SDK 自动生成。
 | `get_config` | 无 | config.yaml 原文(text) | `Backend.ConfigYAML` | readOnly |
 | `apply_config` | `yaml` string 必填;`dry_run` bool 默认 false | 成功:`"applied"` / `"valid"`;校验失败:isError + 错误原文 | `Backend.ApplyConfig` | idempotent |
 | `add_device` | `device` object 必填(结构同 `POST /api/devices` body,见 docs/04) | 成功:`"applied"`;校验失败:isError | 复用 `buildDevice` + `ApplyConfig` | *(无 —— 非幂等)* |
-| `update_device` | `uuid` string 必填;`device` object 必填 | 同上;uuid 不存在:isError | 复用编辑逻辑(保留 uuid/mac/serial/info;auth 密码留空且用户名不变 = 密码不变) | idempotent |
+| `update_device` | `uuid` string 必填;`device` object 必填 | 同上;uuid 不存在:isError | 复用编辑逻辑(保留 uuid/mac/serial/info;auth 密码留空时保留;同名流省略 RTSP userinfo 时保留) | idempotent |
 | `delete_device` | `uuid` string 必填 | 同上 | 复用删除逻辑 | destructive, idempotent |
 | `probe_rtsp` | `url` string 必填,须是合法 `rtsp://` URL(否则被拒,见下文) | rtsp.Result JSON | `rtsp.Probe` | readOnly, openWorld |
-| `get_stream_info` | `url` string 必填,须是合法 `rtsp://` URL(否则被拒,见下文) | ffprobe 流信息 JSON;ffmpeg 缺失:isError | 同 `POST /api/test/streaminfo` | readOnly, openWorld |
+| `get_stream_info` | `url` string 必填,须是合法 `rtsp://` URL(否则被拒,见下文) | ffprobe 流信息 JSON;ffprobe 缺失:isError | 同 `POST /api/test/streaminfo` | readOnly, openWorld |
 | `take_snapshot` | `uuid` string 必填;`stream` string 可选 | image 块(base64 JPEG);失败/无 ffmpeg:isError | `Backend.Snapshot` | readOnly, openWorld |
 | `run_onvif_selftest` | `uuid` string 必填 | `[]onvifCheck` JSON(method/http_status/soap_fault/pass) | `runONVIFSelfTest` | readOnly |
 | `get_discovery_log` | 无 | WS-Discovery 日志 JSON | `Backend.DiscoveryLog` | readOnly |

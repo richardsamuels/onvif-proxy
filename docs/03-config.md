@@ -2,7 +2,9 @@
 
 **English** | [简体中文](03-config.zh-CN.md)
 
-The configuration file is YAML, with a default path of `./config.yaml` (overridable via the `-config` flag or the `CONFIG` environment variable). Edits made through the Web UI are validated and then **atomically written back** to the same file; auto-generated persistent fields (uuid, mac) are also written back. A small set of global fields support runtime overrides via environment variables (see Section 3), which makes it easy to change config in Docker deployments without mounting a file.
+The configuration file is YAML, with a default path of `./config.yaml` (overridable via the `-config` flag or the `CONFIG` environment variable). It is created and rewritten with owner-only permissions (`0600`) because it can contain RTSP and Web passwords. Edits made through the Web UI are validated and then **atomically written back** to the same file; auto-generated persistent fields (uuid, mac) are also written back. A small set of global fields support runtime overrides via environment variables (see Section 3), which makes it easy to change config in Docker deployments without mounting a file.
+
+Hot reload applies device settings plus `server.advertise_ip`, `server.discovery`, and Web credentials live. Changing `web.enabled` or `web.port` through the API requires a process restart, so such an API update is rejected without writing the file. Startup-time environment overrides remain supported for all listed fields, including `ONVIF_WEB_ENABLED` and `ONVIF_WEB_PORT`.
 
 ## 1. Full example
 
@@ -49,18 +51,21 @@ devices:
     streams:
       - name: main               # profile token = profile_main; unique within the device
         rtsp: "rtsp://user:pass@192.168.1.50:554/h264/ch1/main/av_stream"
+        codec: h264              # h264 (default), jpeg/MJPEG, or mpeg4
         width: 2560
         height: 1440
         framerate: 25
         bitrate: 4096            # kbps, used only for capability advertisement
       - name: sub
         rtsp: "rtsp://user:pass@192.168.1.50:554/h264/ch1/sub/av_stream"
+        codec: h264
         width: 640
         height: 360
         framerate: 15
         bitrate: 512
       - name: mobile             # A third, fourth entry, etc. can be added freely
         rtsp: "rtsp://user:pass@192.168.1.50:554/h264/ch1/mobile/av_stream"
+        codec: h264
         width: 352
         height: 288
         framerate: 10
@@ -79,6 +84,7 @@ devices:
     streams:
       - name: main
         rtsp: "rtsp://admin:pw@192.168.1.60:554/cam/realmonitor?channel=3&subtype=0"
+        codec: h264
         width: 1920
         height: 1080
         framerate: 20
@@ -91,7 +97,7 @@ devices:
 
 | Field | Type | Default | Description |
 |------|------|------|------|
-| `advertise_ip` | string | auto-detected | The IP written into XAddrs / StreamUri / SnapshotUri. **URIs inside HTTP responses preferentially use the request's Host header** (NAT-friendly); this field is mainly used for WS-Discovery |
+| `advertise_ip` | string | auto-detected | A valid IPv4 address written into XAddrs / StreamUri / SnapshotUri. **URIs inside HTTP responses preferentially use the request's Host header** (NAT-friendly); this field is mainly used for WS-Discovery |
 | `discovery` | bool | true | Whether to start UDP 3702 |
 
 ### devices[]
@@ -99,15 +105,17 @@ devices:
 | Field | Required | Validation |
 |------|:---:|------|
 | `name` | ✅ | Non-empty; URL-encoded when entering the scope |
-| `uuid` / `mac` / `serial` | — | Generated and **written back to the file** if empty; uuid must be a valid UUID, mac must be a valid MAC address |
+| `uuid` / `mac` / `serial` | — | Generated and **written back to the file** if empty; uuid must be a valid UUID, mac must be a 6-byte MAC-48 address |
 | `ports.soap` / `ports.rtsp` | ✅ | 1-65535; **no conflicts across all devices plus the web port** (validation failure rejects load/save) |
 | `streams[]` | ✅ | At least 1 entry; each → one ONVIF Profile. `name` must be unique within the device (lowercase letters/digits/underscore, used in tokens: `profile_<name>` / `vec_<name>`); the first entry is the primary stream |
 | `streams[].rtsp` | ✅ | Must use the `rtsp://` scheme; may include userinfo; host and path are parsed for use as the proxy target and StreamUri path |
+| `streams[].codec` | — | `h264` (default), `jpeg` (including MJPEG sources), or `mpeg4`; drives the ONVIF `Encoding`, codec-specific configuration node, options, and guaranteed-instance counts. H.265/HEVC is rejected because Profile S has no H.265 encoding |
 | `streams[].width/height/framerate/bitrate` | ✅ | Positive integers; used only for ONVIF capability advertisement, does not affect the actual stream |
-| `streams[].proxy_port` | — | **Required** when this stream's upstream host:port differs from the primary stream (needs its own listening proxy); omit if it matches, in which case it shares `ports.rtsp` |
-| `auth` | — | If provided, both username and password must be non-empty. **This is a layer independent from RTSP credentials**: `auth` protects the virtual device's ONVIF interface (WSSE), while RTSP authentication is done end-to-end between the client and the real camera. Omitting it = no auth required (recommended); if configured, it's suggested to match the camera's RTSP credentials (Unifi Protect only accepts one set of credentials and uses it for both layers) |
-| `snapshot.url` | — | If set, uses passthrough mode; must use the `http(s)://` scheme |
+| `streams[].proxy_port` | — | **Required** when this stream's upstream host:port differs from the primary stream. All streams on the same non-primary upstream must reuse the same value; one port cannot point to different upstreams. Omit it for streams on the primary upstream, which share `ports.rtsp` |
+| `auth` | — | If provided, both username and password must be non-empty. **This is a layer independent from RTSP credentials**: `auth` protects SOAP with WSSE and the snapshot HTTP endpoint with Basic auth, while RTSP authentication is done end-to-end between the client and the real camera. Omitting it = no auth required (recommended); if configured, it's suggested to match the camera's RTSP credentials (Unifi Protect only accepts one set of credentials and uses it for both layers). HTTP Basic does not encrypt credentials, so expose the snapshot endpoint only on a trusted network or through TLS |
+| `snapshot.url` | — | If set, uses passthrough mode; must be an absolute `http(s)://` URL with a host |
 | `snapshot.stream` | — | The stream name used for frame grabbing in ffmpeg mode; defaults to `streams[0].name` |
+| `snapshot.cache_seconds` | — | Snapshot cache duration; `0` uses the 10-second default and negative values are rejected |
 
 ### RTSP URL breakdown logic
 
@@ -115,7 +123,9 @@ devices:
 
 - **Proxy target**: `host:port` (the peer for TCP passthrough);
 - **StreamUri return value**: `rtsp://<advertise>:<proxy port>/path?query` — **credentials do not appear in the StreamUri**; RTSP authentication is done end-to-end between the client and the real camera (the camera credentials entered in the client = the real camera's credentials);
-- **Proxy port allocation for multiple streams**: streams sharing the same `host:port` as the primary stream share `ports.rtsp`; streams with a different upstream must explicitly specify `proxy_port` (one listening port per distinct upstream). The validator checks that all (soap/rtsp/proxy_port/web) ports have no global conflicts.
+- **Proxy port allocation for multiple streams**: streams sharing the same `host:port` as the primary stream share `ports.rtsp`; streams with another common upstream explicitly reuse one `proxy_port` (one listening port per distinct upstream). A port cannot be assigned to two upstreams, and the validator also checks global conflicts across soap/rtsp/proxy/web ports.
+
+The YAML parser accepts exactly one document. Null device/stream entries, unknown fields, extra `---` documents, and trailing YAML content are rejected.
 
 ### Port planning suggestions
 

@@ -82,8 +82,13 @@ Protect ──RTSP DESCRIBE/SETUP/PLAY──▶ RTSP Proxy ──透传──▶
 ```
 UI 保存 ──PUT /api/config──▶ 校验(YAML 语法 + 端口冲突 + 字段合法性)
   ├─ 校验失败 → 400 + 错误详情,不落盘
-  └─ 校验成功 → 原子写 config.yaml → Manager.Reload()
-                  └─ 停旧 Virtual Devices → 起新 Virtual Devices → WS-Discovery 更新设备表(Bye/Hello)
+  └─ 校验成功 → Manager.ApplyConfig()
+                  ├─ 停旧 Virtual Devices
+                  ├─ 预绑定候选配置的全部 SOAP/RTSP listener
+                  ├─ 开启 Discovery 时先完成 UDP 绑定
+                  ├─ 任一步失败 → 恢复上一代运行实例,磁盘文件保持不变
+                  └─ 成功 → 发布新运行实例 → fsync + 原子 rename config.yaml
+                                      → WS-Discovery 更新元数据(Bye/Hello)
 ```
 
 ### 3.4 MCP 工具调用
@@ -146,12 +151,13 @@ onvif-proxy/
 ## 6. 并发与生命周期
 
 - 每个 Virtual Device 的 HTTP server、RTSP 代理各自独立 goroutine;`Manager` 用 `context` 树统一取消。
-- 热重载语义:**stop-then-start**(先全停再全起)。设备数量少(个位数~几十),中断 < 1s,换取实现简单、无端口占用竞态。
+- 热重载语义:**事务式 stop-then-start**。配置写操作串行执行;先停旧实例,同步预绑定候选配置的全部 SOAP/RTSP 端口,只有完整启动成功的候选实例才会原子落盘。绑定、启动或写文件失败会恢复上一代实例并保持旧文件不变。设备状态来自真实 listener 状态,不再把所有已配置设备一律显示为运行中。
+- `server.advertise_ip`、Discovery 元数据和 Discovery 开关支持实时重载;Web 认证中间件逐请求读取生效配置,因此账号密码可实时轮换。会改变 listener 的 `web.enabled`/`web.port` 则明确返回“需重启”,不会假装已经生效。
 - ffmpeg 子进程与 HTTP 请求生命周期绑定:客户端断开 → context 取消 → 进程组 kill,不留僵尸。
 - 优雅退出:SIGTERM → WS-Discovery 发 Bye → 关闭全部 listener → 等待在途请求(超时 5s)。
 
 ## 7. 非目标(明确不做)
 
 - PTZ、音频回传、Events/门铃、ONVIF Profile T/G/M —— Profile S 直播 + 快照即满足 Unifi Protect 收编需求。
-- RTSP 重新封装/转码 —— 客户端拿到的流就是真实摄像头的流,H.265 是否可用取决于客户端本身。
+- RTSP 重新封装/转码 —— 客户端拿到的流就是真实摄像头的流。TCP 代理本身与编码无关,但本 Profile S 实现会明确拒绝 H.265/HEVC 配置,因为 Profile S 没有 H.265 编码器类型。
 - 多节点/集群 —— 单进程单配置文件。

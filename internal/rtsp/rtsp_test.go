@@ -240,6 +240,29 @@ func TestProbe_DialTimeout(t *testing.T) {
 	}
 }
 
+func TestProbeRejectsNonRTSPScheme(t *testing.T) {
+	res := Probe(context.Background(), "http://127.0.0.1:554/stream")
+	if res.OK || res.ErrKind != ErrProtocol {
+		t.Fatalf("result = %+v, want protocol error", res)
+	}
+}
+
+func TestReadResponseLimits(t *testing.T) {
+	t.Run("headers", func(t *testing.T) {
+		raw := "RTSP/1.0 200 OK\r\nX-Large: " + strings.Repeat("x", maxHeaderLen) + "\r\n\r\n"
+		if _, err := readResponse(bufio.NewReader(strings.NewReader(raw))); err == nil {
+			t.Fatal("readResponse accepted oversized headers")
+		}
+	})
+
+	t.Run("body", func(t *testing.T) {
+		raw := fmt.Sprintf("RTSP/1.0 200 OK\r\nContent-Length: %d\r\n\r\n", maxBodyLen+1)
+		if _, err := readResponse(bufio.NewReader(strings.NewReader(raw))); err == nil {
+			t.Fatal("readResponse accepted oversized body")
+		}
+	})
+}
+
 // Known RFC 2617 test vector for the MD5 Digest response.
 func TestDigestResponse_KnownVector(t *testing.T) {
 	got := digestResponse(

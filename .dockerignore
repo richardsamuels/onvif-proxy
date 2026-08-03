@@ -1,0 +1,33 @@
+# Version-control and CI metadata are not needed by the image build.
+.git
+.github
+.gitignore
+
+# Never send runtime configuration or local secrets to the build context.
+config.yaml
+config/
+.env
+.env.*
+!.env.example
+
+# The UI is built and committed separately; only its embedded bundle is needed.
+internal/web/ui/
+**/node_modules/
+!internal/web/static/dist/
+!internal/web/static/dist/**
+
+# Local build/test output.
+onvif-proxy
+coverage.out
+*.coverprofile
+*.log
+tmp/
+
+# Editor and OS metadata.
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+*~
+*.swp
+*.swo

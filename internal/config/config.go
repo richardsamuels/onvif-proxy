@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -76,8 +77,10 @@ type Snapshot struct {
 }
 
 type Stream struct {
-	Name      string `yaml:"name"`
-	RTSP      string `yaml:"rtsp"`
+	Name string `yaml:"name"`
+	RTSP string `yaml:"rtsp"`
+	// Codec is the Profile S video encoding: h264 (default), jpeg, or mpeg4.
+	Codec     string `yaml:"codec,omitempty"`
 	Width     int    `yaml:"width"`
 	Height    int    `yaml:"height"`
 	Framerate int    `yaml:"framerate"`
@@ -115,6 +118,15 @@ func (s *Stream) PathQuery() string {
 // SourceURL returns the full upstream URL including credentials (for ffmpeg
 // and the probe client, never exposed via ONVIF).
 func (s *Stream) SourceURL() string { return s.RTSP }
+
+// CodecName returns the canonical configured codec. Empty keeps older configs
+// backward compatible by defaulting to H.264.
+func (s *Stream) CodecName() string {
+	if s.Codec == "" {
+		return "h264"
+	}
+	return strings.ToLower(s.Codec)
+}
 
 func (s *Stream) ProfileToken() string { return "profile_" + s.Name }
 func (s *Stream) EncoderToken() string { return "vec_" + s.Name }
@@ -211,7 +223,7 @@ devices: []
 // WriteDefault creates a starter config at path. It never overwrites: the
 // file is created with O_EXCL and an error is returned if it already exists.
 func WriteDefault(path string) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
@@ -251,6 +263,13 @@ func Parse(data []byte) (*Config, error) {
 	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("yaml: %w", err)
 	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err != nil {
+			return nil, fmt.Errorf("yaml trailing document: %w", err)
+		}
+		return nil, fmt.Errorf("yaml: multiple documents are not allowed")
+	}
 	if cfg.Web.Port == 0 {
 		cfg.Web.Port = 8080
 	}
@@ -260,22 +279,55 @@ func Parse(data []byte) (*Config, error) {
 	return cfg, nil
 }
 
+// Prepare strictly parses data, fills generated device identities, and returns
+// the exact YAML bytes that should be persisted. When no identities need to be
+// generated, the original bytes are returned unchanged so comments and
+// formatting survive a transactional apply.
+func Prepare(data []byte) (*Config, []byte, error) {
+	cfg, err := Parse(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !cfg.fillGenerated() {
+		return cfg, data, nil
+	}
+	prepared, err := marshal(cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal generated identities: %w", err)
+	}
+	return cfg, prepared, nil
+}
+
 // Save atomically writes the config. Note: comments in a hand-written file
 // are not preserved (the struct is re-marshaled).
 func Save(path string, cfg *Config) error {
+	data, err := marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return saveBytes(path, data)
+}
+
+func marshal(cfg *Config) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(2)
 	if err := enc.Encode(cfg); err != nil {
-		return err
+		return nil, err
 	}
-	enc.Close()
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func saveBytes(path string, data []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.yaml")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(buf.Bytes()); err != nil {
+	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -321,6 +373,13 @@ func (c *Config) Validate() error {
 	var errs []string
 	add := func(format string, a ...any) { errs = append(errs, fmt.Sprintf(format, a...)) }
 
+	if c.Server.AdvertiseIP != "" {
+		ip := net.ParseIP(c.Server.AdvertiseIP)
+		if ip == nil || ip.To4() == nil {
+			add("server.advertise_ip: must be a valid IPv4 address")
+		}
+	}
+
 	ports := map[int]string{} // port -> owner description
 	claim := func(port int, owner string) {
 		if port <= 0 || port > 65535 {
@@ -343,6 +402,10 @@ func (c *Config) Validate() error {
 
 	names := map[string]bool{}
 	for i, d := range c.Devices {
+		if d == nil {
+			add("devices[%d]: device must not be null", i)
+			continue
+		}
 		id := fmt.Sprintf("devices[%d] (%q)", i, d.Name)
 		if d.Name == "" {
 			add("%s: name is required", id)
@@ -355,7 +418,8 @@ func (c *Config) Validate() error {
 			add("%s: invalid uuid %q", id, d.UUID)
 		}
 		if d.MAC != "" {
-			if _, err := net.ParseMAC(d.MAC); err != nil {
+			mac, err := net.ParseMAC(d.MAC)
+			if err != nil || len(mac) != 6 {
 				add("%s: invalid mac %q", id, d.MAC)
 			}
 		}
@@ -372,7 +436,13 @@ func (c *Config) Validate() error {
 		}
 		streamNames := map[string]bool{}
 		var primaryTarget string
+		targetPorts := map[string]int{}
+		portTargets := map[int]string{}
 		for j, s := range d.Streams {
+			if s == nil {
+				add("%s streams[%d]: stream must not be null", id, j)
+				continue
+			}
 			sid := fmt.Sprintf("%s streams[%d] (%q)", id, j, s.Name)
 			if !streamNameRe.MatchString(s.Name) {
 				add("%s: stream name must match %s", sid, streamNameRe)
@@ -389,11 +459,21 @@ func (c *Config) Validate() error {
 			}
 			s.u = u
 
+			switch s.CodecName() {
+			case "h264", "jpeg", "mpeg4":
+			case "h265", "hevc":
+				add("%s: codec %q is not supported by ONVIF Profile S; use h264, jpeg, or mpeg4",
+					sid, s.Codec)
+			default:
+				add("%s: codec must be h264, jpeg, or mpeg4", sid)
+			}
 			if s.Width <= 0 || s.Height <= 0 || s.Framerate <= 0 || s.Bitrate <= 0 {
 				add("%s: width/height/framerate/bitrate must be positive", sid)
 			}
 			if j == 0 {
 				primaryTarget = s.TargetAddr()
+				targetPorts[primaryTarget] = d.Ports.RTSP
+				portTargets[d.Ports.RTSP] = primaryTarget
 				if s.ProxyPort != 0 {
 					add("%s: primary stream uses ports.rtsp, proxy_port not allowed", sid)
 				}
@@ -402,6 +482,21 @@ func (c *Config) Validate() error {
 					add("%s: upstream %s differs from primary %s, proxy_port is required",
 						sid, s.TargetAddr(), primaryTarget)
 				} else {
+					target := s.TargetAddr()
+					if expected, ok := targetPorts[target]; ok {
+						if s.ProxyPort != expected {
+							add("%s: upstream %s already uses proxy_port %d",
+								sid, target, expected)
+						}
+						continue
+					}
+					if previousTarget, ok := portTargets[s.ProxyPort]; ok {
+						add("%s: proxy_port %d already points to upstream %s, cannot also point to %s",
+							sid, s.ProxyPort, previousTarget, target)
+						continue
+					}
+					targetPorts[target] = s.ProxyPort
+					portTargets[s.ProxyPort] = target
 					claim(s.ProxyPort, sid+" proxy_port")
 				}
 			} else if s.ProxyPort != 0 {
@@ -411,9 +506,12 @@ func (c *Config) Validate() error {
 
 		if d.Snapshot.URL != "" {
 			su, err := url.Parse(d.Snapshot.URL)
-			if err != nil || (su.Scheme != "http" && su.Scheme != "https") {
-				add("%s: snapshot.url must be http(s)", id)
+			if err != nil || (su.Scheme != "http" && su.Scheme != "https") || su.Hostname() == "" {
+				add("%s: snapshot.url must be a valid http(s) URL", id)
 			}
+		}
+		if d.Snapshot.CacheSeconds < 0 {
+			add("%s: snapshot.cache_seconds must not be negative", id)
 		}
 		if d.Snapshot.Stream != "" && !streamNames[d.Snapshot.Stream] {
 			add("%s: snapshot.stream %q not found", id, d.Snapshot.Stream)

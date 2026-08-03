@@ -1,26 +1,39 @@
 // Package onvif implements the ONVIF Device and Media services for a single
 // virtual device. Each device runs one http.Server bound to dev.Ports.SOAP
 // and serves POST /onvif/device_service, POST /onvif/media_service and an
-// unauthenticated GET /onvif/snapshot. Responses are hand-written XML
-// templates matching the ONVIF WSDL element definitions; every dynamic value
-// is XML-escaped. Method coverage follows docs/02 sections 4 and 5.
+// GET /onvif/snapshot (HTTP Basic when device auth is configured). Responses
+// are hand-written XML templates matching the ONVIF WSDL element definitions;
+// every dynamic value is XML-escaped. Method coverage follows docs/02 sections
+// 4 and 5.
 package onvif
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Aiaid/onvif-proxy/internal/config"
 	"github.com/Aiaid/onvif-proxy/internal/soap"
 )
 
-// clockSkew is the tolerance applied to the WSSE Created timestamp.
-const clockSkew = 5 * time.Minute
+const (
+	// clockSkew is the tolerance applied to the WSSE Created timestamp.
+	clockSkew = 5 * time.Minute
+
+	maxSOAPBodyBytes  = 1 << 20 // 1 MiB
+	readHeaderTimeout = 5 * time.Second
+	readTimeout       = 15 * time.Second
+	idleTimeout       = 60 * time.Second
+	maxHeaderBytes    = 64 << 10 // 64 KiB
+	maxNonceCache     = 4096
+)
 
 // Options configures a Server. It carries values injected by main that cannot
 // be derived from the device config alone.
@@ -37,14 +50,21 @@ type Options struct {
 
 // Server serves the ONVIF services for one device.
 type Server struct {
-	dev  *config.Device
-	opts Options
-	mux  *http.ServeMux
+	dev        *config.Device
+	opts       Options
+	mux        *http.ServeMux
+	nonceMu    sync.Mutex
+	usedNonces map[[32]byte]time.Time
 }
 
 // NewServer builds a Server and its route table for dev.
 func NewServer(dev *config.Device, opts Options) *Server {
-	s := &Server{dev: dev, opts: opts, mux: http.NewServeMux()}
+	s := &Server{
+		dev:        dev,
+		opts:       opts,
+		mux:        http.NewServeMux(),
+		usedNonces: make(map[[32]byte]time.Time),
+	}
 	s.mux.HandleFunc("POST /onvif/device_service", s.handleDevice)
 	s.mux.HandleFunc("POST /onvif/media_service", s.handleMedia)
 	s.mux.HandleFunc("GET /onvif/snapshot", s.handleSnapshot)
@@ -54,12 +74,20 @@ func NewServer(dev *config.Device, opts Options) *Server {
 // Run listens on dev.Ports.SOAP and serves until ctx is cancelled, then shuts
 // down gracefully.
 func (s *Server) Run(ctx context.Context) error {
-	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.dev.Ports.SOAP),
-		Handler: s.mux,
+	ln, err := net.Listen("tcp4", fmt.Sprintf(":%d", s.dev.Ports.SOAP))
+	if err != nil {
+		return err
 	}
+	return s.Serve(ctx, ln)
+}
+
+// Serve serves on an already-bound listener. It lets callers reserve and
+// validate a port before replacing a running configuration generation.
+// Serve owns ln and closes it during shutdown.
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	srv := s.httpServer()
 	errc := make(chan error, 1)
-	go func() { errc <- srv.ListenAndServe() }()
+	go func() { errc <- srv.Serve(ln) }()
 
 	select {
 	case <-ctx.Done():
@@ -75,11 +103,21 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
+func (s *Server) httpServer() *http.Server {
+	return &http.Server{
+		Handler:           s.mux,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
+}
+
 // ---- request helpers ------------------------------------------------------
 
-// parse reads and decodes the SOAP request body.
-func parse(r *http.Request) (*soap.Request, error) {
-	body, err := io.ReadAll(r.Body)
+// parse reads and decodes a size-limited SOAP request body.
+func parse(w http.ResponseWriter, r *http.Request) (*soap.Request, error) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSOAPBodyBytes))
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +135,44 @@ func (s *Server) authorized(req *soap.Request, action string) bool {
 	if req.Security == nil {
 		return false
 	}
-	return req.Security.Verify(s.dev.Auth.Username, s.dev.Auth.Password, clockSkew)
+	if !req.Security.Verify(s.dev.Auth.Username, s.dev.Auth.Password, clockSkew) {
+		return false
+	}
+	if !req.Security.IsDigest() {
+		return true
+	}
+	return s.acceptNonce(req.Security.Username, req.Security.Nonce, req.Security.Created)
+}
+
+// acceptNonce rejects replay of a successfully verified digest during the
+// WSSE clock-skew window. The cache is bounded in time and can only be filled
+// by a caller that already knows the configured password.
+func (s *Server) acceptNonce(username, nonce, created string) bool {
+	key := sha256.Sum256([]byte(username + "\x00" + nonce + "\x00" + created))
+	now := time.Now()
+
+	s.nonceMu.Lock()
+	defer s.nonceMu.Unlock()
+	for k, seen := range s.usedNonces {
+		if now.Sub(seen) > 2*clockSkew {
+			delete(s.usedNonces, k)
+		}
+	}
+	if _, exists := s.usedNonces[key]; exists {
+		return false
+	}
+	if len(s.usedNonces) >= maxNonceCache {
+		var oldestKey [32]byte
+		var oldestTime time.Time
+		for k, seen := range s.usedNonces {
+			if oldestTime.IsZero() || seen.Before(oldestTime) {
+				oldestKey, oldestTime = k, seen
+			}
+		}
+		delete(s.usedNonces, oldestKey)
+	}
+	s.usedNonces[key] = now
+	return true
 }
 
 // write renders an ONVIF response body inside a SOAP envelope.
@@ -142,9 +217,14 @@ func (s *Server) advertiseIP(r *http.Request) string {
 
 // ---- snapshot -------------------------------------------------------------
 
-// handleSnapshot serves GET /onvif/snapshot?token=<profileToken>. It is
-// unauthenticated by design and delegates image production to SnapshotFunc.
+// handleSnapshot serves GET /onvif/snapshot?token=<profileToken>. When ONVIF
+// auth is configured it requires the same credentials via HTTP Basic.
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	if s.dev.Auth != nil && !s.snapshotAuthorized(r) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="ONVIF Snapshot"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	token := r.URL.Query().Get("token")
 	stream := s.dev.StreamByProfileToken(token)
 	if stream == nil {
@@ -166,6 +246,18 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", contentType)
 	w.WriteHeader(http.StatusOK)
 	w.Write(data)
+}
+
+func (s *Server) snapshotAuthorized(r *http.Request) bool {
+	username, password, ok := r.BasicAuth()
+	if !ok {
+		return false
+	}
+	gotUser, wantUser := sha256.Sum256([]byte(username)), sha256.Sum256([]byte(s.dev.Auth.Username))
+	gotPass, wantPass := sha256.Sum256([]byte(password)), sha256.Sum256([]byte(s.dev.Auth.Password))
+	userOK := subtle.ConstantTimeCompare(gotUser[:], wantUser[:])
+	passOK := subtle.ConstantTimeCompare(gotPass[:], wantPass[:])
+	return userOK&passOK == 1
 }
 
 // ---- info defaults --------------------------------------------------------

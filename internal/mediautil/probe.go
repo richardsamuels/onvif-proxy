@@ -40,6 +40,14 @@ type ffprobeOutput struct {
 	Streams []ffprobeStream `json:"streams"`
 }
 
+// ProbeAvailable reports whether the ffprobe binary used by ProbeInfo is on
+// PATH. ffmpeg and ffprobe are packaged together in the container, but bare
+// metal installations can have only one of them.
+func ProbeAvailable() bool {
+	_, err := exec.LookPath("ffprobe")
+	return err == nil
+}
+
 // ProbeInfo runs ffprobe against an RTSP URL and returns the first video
 // stream's codec, resolution and frame rate. The URL is passed only as an exec
 // argument, never through a shell. When ctx has no deadline a 15s timeout is

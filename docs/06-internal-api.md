@@ -12,7 +12,9 @@ Module path: `github.com/Aiaid/onvif-proxy`. Dependency rules: every package may
 type Config struct { Server ServerConfig; Web WebConfig; Devices []*Device }
 func Load(path string) (*Config, error)          // read + validate + generate uuid/mac and persist
 func Parse(data []byte) (*Config, error)         // strict parse + validate (for dry-run)
+func Prepare(data []byte) (*Config, []byte, error) // parse + validate + generate identity; returns canonical YAML without writing
 func Save(path string, cfg *Config) error        // atomic write
+func WriteDefault(path string) error             // exclusive-create starter config with mode 0600
 func ApplyEnvOverrides(cfg *Config) ([]string, error) // ONVIF_* env overrides (in-memory only, re-validated after overriding); returns the applied items for logging
 func DetectAdvertiseIP() string
 
@@ -26,7 +28,8 @@ func (d *Device) ProxyBindings() []ProxyBinding  // {ListenPort int; Target stri
 func (d *Device) SnapshotStream() *Stream
 func (d *Device) SnapshotCacheSeconds() int
 
-type Stream struct { Name, RTSP string; Width, Height, Framerate, Bitrate, ProxyPort int }
+type Stream struct { Name, RTSP, Codec string; Width, Height, Framerate, Bitrate, ProxyPort int }
+func (s *Stream) CodecName() string // canonical h264(default), jpeg, or mpeg4
 func (s *Stream) TargetAddr() string             // "host:port" (default 554)
 func (s *Stream) PathQuery() string              // "/path?query"
 func (s *Stream) SourceURL() string              // full upstream URL including credentials
@@ -85,14 +88,15 @@ type Options struct {
 
 func NewServer(dev *config.Device, opts Options) *Server
 func (s *Server) Run(ctx context.Context) error // listens on dev.Ports.SOAP; shuts down gracefully when ctx is canceled
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error // serves an already-bound listener
 
 // Routes:
 //   POST /onvif/device_service
 //   POST /onvif/media_service
-//   GET  /onvif/snapshot?token=<profileToken>   (no WSSE required; calls SnapshotFunc)
+//   GET  /onvif/snapshot?token=<profileToken>   (HTTP Basic required when dev.Auth is configured)
 ```
 
-Behavioral requirements (see docs/02-onvif-spec.md for details): the method matrix follows sections 4/5 of document 02; `GetSystemDateAndTime` requires no authentication; when `dev.Auth == nil` everything is allowed through unauthenticated; URI construction prefers `r.Host`; unknown methods → `soap.WriteActionNotSupported`.
+Behavioral requirements (see docs/02-onvif-spec.md for details): the method matrix follows sections 4/5 of document 02; `GetSystemDateAndTime` requires no authentication; when `dev.Auth == nil` everything is allowed through unauthenticated; PasswordDigest requires a fresh valid timestamp/nonce and rejects nonce replay; URI construction prefers `r.Host`; unknown methods → `soap.WriteActionNotSupported`. SOAP bodies are capped at 1 MiB and HTTP header/read/idle timeouts are bounded.
 
 ## internal/discovery (WS-Discovery)
 
@@ -104,7 +108,9 @@ type LogEntry struct { Time time.Time; Remote, Kind, Detail string } // Kind: pr
 
 func New(devices []Device) *Server
 func (s *Server) Run(ctx context.Context) error  // binds :3702, joins the multicast group, sends Hello; sends Bye when ctx is canceled
-func (s *Server) SetDevices(devices []Device)    // hot reload: sends Bye/Hello for the diff set
+func Listen() (*net.UDPConn, *net.UDPAddr, error) // synchronously binds and joins the multicast group
+func (s *Server) Serve(ctx context.Context, conn *net.UDPConn, addr *net.UDPAddr) error
+func (s *Server) SetDevices(devices []Device)    // hot reload: sends Bye/Hello for removals, additions, and metadata changes
 func (s *Server) Log() []LogEntry                // last 50 entries, newest first
 ```
 
@@ -115,8 +121,10 @@ package rtspproxy
 
 // Listens on listenPort across all interfaces (not just 127.0.0.1), bidirectionally
 // io.Copy to target ("host:port"). Closes the listener and all in-flight connections
-// when ctx is canceled. Returns the net.Listen error or ctx.Err().
+// when ctx is canceled. Each proxy accepts at most 128 active connections and enforces
+// a shared bidirectional idle timeout.
 func Run(ctx context.Context, listenPort int, target string) error
+func Serve(ctx context.Context, ln net.Listener, target string) error
 ```
 
 ## internal/rtsp (native RTSP probing client)
@@ -154,6 +162,7 @@ func Probe(ctx context.Context, rawURL string) *Result
 package mediautil
 
 func Available() bool // whether ffmpeg is present on PATH
+func ProbeAvailable() bool // whether ffprobe is present on PATH
 
 // Grabs a single JPEG frame: -rtsp_transport tcp -frames:v 1; a summary of stderr is folded into error
 func Grab(ctx context.Context, rtspURL string) ([]byte, error)
@@ -202,7 +211,7 @@ type Backend interface {
     DiscoveryLog() []discovery.LogEntry
     Status() Status
 }
-type DeviceRuntime struct { Device *config.Device; Running bool }
+type DeviceRuntime struct { Device *config.Device; Running bool; Error string }
 type Status struct {
     Version, AdvertiseIP string
     UptimeSeconds        int64
@@ -211,6 +220,7 @@ type Status struct {
 
 func New(cfg config.WebConfig, backend Backend) *Server
 func (s *Server) Run(ctx context.Context) error
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error // serves an already-bound listener
 ```
 
 See docs/04-web-api.md for REST routes and semantics (`/api/config`, `/api/devices`, `/api/test/rtsp`, `/api/test/streaminfo`, `/api/test/snapshot`, `/api/preview`, `/api/test/onvif`, `/api/discovery/log`, `/api/status`, `/healthz`). Key points:
@@ -218,8 +228,8 @@ See docs/04-web-api.md for REST routes and semantics (`/api/config`, `/api/devic
 - Probing calls `rtsp.Probe` directly; preview calls `mediautil.ServeMJPEG` directly (concurrency capped at 2 per device, with the web layer managing the semaphore); snapshots go through `Backend.Snapshot` (caching/pass-through is composed on the main side);
 - The **ONVIF self-test** is implemented inside the web package: it sends hand-written SOAP envelopes method by method to `dev.Ports.SOAP` (WSSE generated according to dev.Auth), returning `[{method, http_status, soap_fault, pass}]` per the method list in docs/04-web-api.md; a final call to a nonexistent method is appended, whose pass condition is that the response body is a well-formed Fault XML with subcode ActionNotSupported;
 - Static UI: the Preact+TSX source lives in `internal/web/ui/`, bundled by esbuild into `static/dist/{app.js,app.css}` (committed to the repository); `index.html` is a thin shell; `go:embed all:static` embeds it into the binary (including `dist/`); `GET /dist/*` is served from the embedded FS via `http.FileServerFS`; `PUT /api/devices/{uuid}` edits a device (see docs/04-web-api.md); the `GET /api/devices` DTO additionally supplies `rtsp_port/auth_user` and per-stream source parameters to prefill the edit form;
-- Basic authentication: applies to all routes when cfg.Username is non-empty.
+- Basic authentication: applies to all routes when cfg.Username is non-empty. When the backend also implements `WebConfig() config.WebConfig`, credentials are read dynamically so username/password changes take effect without restarting the web listener.
 
 ## cmd/onvif-proxy (main, integration layer, implemented last)
 
-Responsibilities: flag parsing (`-config`, default `./config.yaml`; `-version`) → `config.Load` → assemble the Manager (implements `web.Backend`; starts an onvif.Server + rtspproxy per device; discovery.Server; snapshot function = pass-through or mediautil.Grab + Cache) → signal handling and hot reload (stop-then-start).
+Responsibilities: flag parsing (`-config`, default `./config.yaml`; `-version`) → `config.Load` → assemble the Manager (implements `web.Backend`; starts an onvif.Server + rtspproxy per device; discovery.Server; snapshot function = pass-through or mediautil.Grab + Cache) → signal handling and transactional hot reload. Reload first prepares the candidate and synchronously pre-binds every SOAP/RTSP/discovery listener. A bind or persistence failure restores the old generation and leaves the old file/runtime usable; successful persistence uses a same-directory atomic rename with mode 0600. `web.username/password` reload live, while changing `web.enabled` or `web.port` is rejected as restart-required.

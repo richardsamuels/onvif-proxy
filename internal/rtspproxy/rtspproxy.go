@@ -6,6 +6,7 @@ package rtspproxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"strconv"
@@ -13,7 +14,11 @@ import (
 	"time"
 )
 
-const dialTimeout = 5 * time.Second
+const (
+	dialTimeout    = 5 * time.Second
+	idleTimeout    = 2 * time.Minute
+	maxConnections = 128
+)
 
 // Run listens on all interfaces at listenPort and forwards each connection to
 // target via two io.Copy goroutines; when either direction closes, both sides
@@ -21,10 +26,19 @@ const dialTimeout = 5 * time.Second
 // connection. It returns the net.Listen error or, on shutdown, ctx.Err().
 func Run(ctx context.Context, listenPort int, target string) error {
 	lc := net.ListenConfig{}
-	ln, err := lc.Listen(ctx, "tcp", ":"+strconv.Itoa(listenPort))
+	ln, err := lc.Listen(ctx, "tcp4", ":"+strconv.Itoa(listenPort))
 	if err != nil {
 		return err
 	}
+	return Serve(ctx, ln, target)
+}
+
+// Serve forwards connections accepted from an already-bound listener. It lets
+// callers reserve and validate a port before switching configuration. Serve
+// owns ln and closes it when ctx is cancelled.
+func Serve(ctx context.Context, ln net.Listener, target string) error {
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	defer cancelServe()
 
 	var (
 		mu     sync.Mutex
@@ -33,10 +47,27 @@ func Run(ctx context.Context, listenPort int, target string) error {
 		closed bool
 	)
 
-	track := func(c net.Conn) {
+	closeAll := func() {
 		mu.Lock()
+		defer mu.Unlock()
+		if closed {
+			return
+		}
+		closed = true
+		_ = ln.Close()
+		for c := range conns {
+			_ = c.Close()
+		}
+	}
+	track := func(c net.Conn) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if closed {
+			c.Close()
+			return false
+		}
 		conns[c] = struct{}{}
-		mu.Unlock()
+		return true
 	}
 	untrack := func(c net.Conn) {
 		mu.Lock()
@@ -48,61 +79,80 @@ func Run(ctx context.Context, listenPort int, target string) error {
 	stop := make(chan struct{})
 	go func() {
 		select {
-		case <-ctx.Done():
+		case <-serveCtx.Done():
 		case <-stop:
 			return
 		}
-		mu.Lock()
-		closed = true
-		ln.Close()
-		for c := range conns {
-			c.Close()
-		}
-		mu.Unlock()
+		closeAll()
 	}()
 
+	slots := make(chan struct{}, maxConnections)
+	var serveErr error
 	for {
 		client, err := ln.Accept()
 		if err != nil {
-			mu.Lock()
-			isClosed := closed
-			mu.Unlock()
-			if isClosed {
+			if serveCtx.Err() != nil {
+				serveErr = serveCtx.Err()
 				break
 			}
 			// Back off briefly on temporary accept errors, then retry.
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				time.Sleep(10 * time.Millisecond)
+				select {
+				case <-time.After(10 * time.Millisecond):
+				case <-serveCtx.Done():
+					serveErr = serveCtx.Err()
+					break
+				}
+				if serveErr != nil {
+					break
+				}
 				continue
 			}
+			serveErr = err
 			break
 		}
 
+		select {
+		case slots <- struct{}{}:
+		default:
+			_ = client.Close()
+			continue
+		}
 		wg.Add(1)
 		go func(client net.Conn) {
 			defer wg.Done()
-			track(client)
+			defer func() { <-slots }()
+			rawClient := client
+			if !track(rawClient) {
+				return
+			}
 			defer func() {
-				untrack(client)
-				client.Close()
+				untrack(rawClient)
+				_ = rawClient.Close()
 			}()
 
-			upstream, err := net.DialTimeout("tcp", target, dialTimeout)
+			dialer := net.Dialer{Timeout: dialTimeout}
+			upstream, err := dialer.DialContext(serveCtx, "tcp", target)
 			if err != nil {
 				return
 			}
-			track(upstream)
+			rawUpstream := upstream
+			if !track(rawUpstream) {
+				return
+			}
 			defer func() {
-				untrack(upstream)
-				upstream.Close()
+				untrack(rawUpstream)
+				_ = rawUpstream.Close()
 			}()
+
+			clientPipe, upstreamPipe := withIdleTimeout(rawClient, rawUpstream, idleTimeout)
 
 			// Bidirectional copy; closing on either side unblocks the other.
 			var once sync.Once
 			closeBoth := func() {
 				once.Do(func() {
-					client.Close()
-					upstream.Close()
+					_ = rawClient.Close()
+					_ = rawUpstream.Close()
 				})
 			}
 
@@ -110,12 +160,12 @@ func Run(ctx context.Context, listenPort int, target string) error {
 			pipeWg.Add(2)
 			go func() {
 				defer pipeWg.Done()
-				io.Copy(upstream, client)
+				io.Copy(upstreamPipe, clientPipe)
 				closeBoth()
 			}()
 			go func() {
 				defer pipeWg.Done()
-				io.Copy(client, upstream)
+				io.Copy(clientPipe, upstreamPipe)
 				closeBoth()
 			}()
 			pipeWg.Wait()
@@ -123,6 +173,57 @@ func Run(ctx context.Context, listenPort int, target string) error {
 	}
 
 	close(stop)
+	cancelServe()
+	closeAll()
 	wg.Wait()
-	return ctx.Err()
+	if serveErr != nil {
+		return serveErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return errors.New("rtsp proxy stopped")
+}
+
+// activityDeadline shares one idle deadline across both halves of a proxied
+// connection. Activity in either direction refreshes both sockets, which is
+// important for one-way RTP-over-RTSP streams.
+type activityDeadline struct {
+	conns   []net.Conn
+	timeout time.Duration
+}
+
+func (d *activityDeadline) touch() {
+	deadline := time.Now().Add(d.timeout)
+	for _, c := range d.conns {
+		_ = c.SetDeadline(deadline)
+	}
+}
+
+type activityConn struct {
+	net.Conn
+	deadline *activityDeadline
+}
+
+func (c *activityConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.deadline.touch()
+	}
+	return n, err
+}
+
+func (c *activityConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.deadline.touch()
+	}
+	return n, err
+}
+
+func withIdleTimeout(a, b net.Conn, timeout time.Duration) (net.Conn, net.Conn) {
+	deadline := &activityDeadline{conns: []net.Conn{a, b}, timeout: timeout}
+	deadline.touch()
+	return &activityConn{Conn: a, deadline: deadline},
+		&activityConn{Conn: b, deadline: deadline}
 }

@@ -7,7 +7,9 @@ services:
     build: .
     restart: unless-stopped
     volumes:
-      - ./config:/config
+      # A named volume inherits the image's non-root ownership, so first-run
+      # config generation works without changing host-directory permissions.
+      - onvif-config:/config
     # Runtime overrides (env > yaml, never written back to config.yaml);
     # full list in docs/03-config.md.
     # environment:
@@ -38,3 +40,6 @@ services:
 #         - subnet: 192.168.1.0/24
 #           gateway: 192.168.1.1
 #           ip_range: 192.168.1.96/28
+
+volumes:
+  onvif-config:

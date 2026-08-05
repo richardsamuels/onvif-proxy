@@ -9,8 +9,8 @@
     "build": "esbuild src/main.tsx --bundle --minify --format=esm --target=es2020 --jsx=automatic --jsx-import-source=preact --outfile=../static/dist/app.js"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0",
-    "preact": "^10.26.0",
-    "typescript": "^5.9.0"
+    "esbuild": "^0.28.1",
+    "preact": "^10.29.8",
+    "typescript": "^7.0.2"
   }
 }

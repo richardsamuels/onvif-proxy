@@ -18,7 +18,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}"
     -o /out/onvif-proxy ./cmd/onvif-proxy
 
 # ---- runtime ----
-FROM alpine:3.20
+FROM alpine:3.24
 ARG UID=10001
 ARG GID=10001
 RUN apk add --no-cache ffmpeg tzdata ca-certificates \

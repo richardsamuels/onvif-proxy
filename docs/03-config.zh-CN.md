@@ -4,7 +4,7 @@
 
 配置文件为 YAML,默认路径 `./config.yaml`(可用 `-config` 参数或 `CONFIG` 环境变量覆盖)。配置可能包含 RTSP/Web 密码,因此创建和重写时均使用仅所有者可读写的 `0600` 权限。Web UI 的修改经校验后**原子写回**同一文件;程序自动生成的持久化字段(uuid、mac)也会写回。少量全局字段支持环境变量运行时覆盖(见第 3 节),便于 Docker 部署时免挂载改配置。
 
-热重载可实时应用设备配置、`server.advertise_ip`、`server.discovery` 和 Web 凭证。通过 API 修改 `web.enabled` 或 `web.port` 需要重启进程,因此接口会拒绝并且不落盘;启动时的环境变量覆盖不受影响,包括 `ONVIF_WEB_ENABLED` 和 `ONVIF_WEB_PORT`。
+热重载可实时应用设备配置、`server.advertise_ip`、`server.discovery`、`alarm` 段和 Web 凭证(重载会把所有设备的移动侦测状态重置为未触发)。通过 API 修改 `web.enabled` 或 `web.port` 需要重启进程,因此接口会拒绝并且不落盘;启动时的环境变量覆盖不受影响,包括 `ONVIF_WEB_ENABLED` 和 `ONVIF_WEB_PORT`。
 
 ## 1. 完整示例
 
@@ -23,6 +23,12 @@ web:
   # Web UI 的 HTTP Basic 认证,留空则不启用
   username: ""
   password: ""
+
+# TVT / ENS XML 报警服务器接收器(见 08 文档)。整段可省略(= 关闭)。
+alarm:
+  enabled: false
+  port: 8899                     # NVR 向此端口 POST /SendAlarmStatus;motionAlarm id N -> devices[N-1]
+  hold_seconds: 60               # 通道超过此时长未再报 true 则自动清除;0 = 不超时
 
 # 虚拟设备列表,每台 = 一个 ONVIF 摄像机
 devices:
@@ -98,6 +104,16 @@ devices:
 | `advertise_ip` | string | 自动探测 | 写进 XAddrs / StreamUri / SnapshotUri 的合法 IPv4 地址。**HTTP 响应内的 URI 优先使用请求的 Host 头**(NAT 友好),此字段主要供 WS-Discovery 使用 |
 | `discovery` | bool | true | 是否启动 UDP 3702 |
 
+### alarm
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `enabled` | bool | false | 启动 `SendAlarmStatus` 接收器(见 [08-alarm-server.zh-CN.md](08-alarm-server.zh-CN.md)) |
+| `port` | int | 8899 | 接收器 TCP 端口,1-65535;启用时参与全局端口冲突校验 |
+| `hold_seconds` | int | 60 | 安全超时:通道超过该秒数未再报 `true` 即被清除。`0` 关闭超时;负数被拒绝 |
+
+通道映射:`motionAlarm id="N"` 驱动 `devices[N-1]`,因此设备在列表中的顺序有意义。超出列表的 id 只记录一次日志并忽略。
+
 ### devices[]
 
 | 字段 | 必填 | 校验 |
@@ -132,10 +148,11 @@ YAML 只允许一个文档。设备或流中的 `null` 项、未知字段、额�
 | web | 8080 |
 | 设备 soap | 8081、8082、… |
 | 设备 rtsp | 8554、8555、… |
+| 报警接收器 | 8899 |
 
 ## 3. 环境变量覆盖
 
-面向 Docker/compose 场景:`server` 与 `web` 两段的全局字段可用环境变量覆盖,不必往挂载卷里预写敏感信息。
+面向 Docker/compose 场景:`server`、`web`、`alarm` 三段的全局字段可用环境变量覆盖,不必往挂载卷里预写敏感信息。
 
 | 环境变量 | 覆盖字段 | 取值 |
 |------|------|------|
@@ -146,6 +163,8 @@ YAML 只允许一个文档。设备或流中的 `null` 项、未知字段、额�
 | `ONVIF_WEB_PORT` | `web.port` | 1-65535 |
 | `ONVIF_WEB_USERNAME` | `web.username` | 字符串 |
 | `ONVIF_WEB_PASSWORD` | `web.password` | 字符串 |
+| `ONVIF_ALARM_ENABLED` | `alarm.enabled` | `true` / `false` |
+| `ONVIF_ALARM_PORT` | `alarm.port` | 1-65535 |
 
 语义:
 

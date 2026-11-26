@@ -9,6 +9,8 @@
 | ONVIF Core Specification | Device 服务、发现、安全、Fault 语义 |
 | ONVIF Media Service Specification (ver10) | Media 服务、Profile/StreamUri/SnapshotUri |
 | ONVIF Profile S | 必选功能集的判定基准 |
+| ONVIF Event Service Specification / OASIS WS-BaseNotification 1.3 | Events 服务、PullPoint 订阅、移动侦测 topic |
+| W3C WS-Addressing 1.0 | 事件消息的 `wsa:Action` / `wsa:To` 头 |
 | W3C SOAP 1.2 | Envelope 结构、Fault 结构、HTTP 状态码映射 |
 | WS-Discovery (2005/04 draft,ONVIF 指定版本) | UDP 3702 组播发现 |
 | OASIS WS-Security UsernameToken Profile 1.0 | WSSE PasswordDigest 认证 |
@@ -28,7 +30,7 @@
 ### 1.2 响应
 
 - 统一 `Content-Type: application/soap+xml; charset=utf-8`。
-- 响应模板逐条对照 ONVIF WSDL 的 element 定义手写,命名空间前缀固定声明在 Envelope 上(`tds`/`trt`/`tt`/`ter` 等)。
+- 响应模板逐条对照 ONVIF WSDL 的 element 定义手写,命名空间前缀固定声明在 Envelope 上(`tds`/`trt`/`tt`/`ter`/`tev`/`wsnt`/`wsa`/`tns1`/`wstop`)。事件响应还带 `<wsa:Action>` 头。
 - 所有动态字段经 XML 转义。
 
 ### 1.3 Fault 语义(核心差异点)
@@ -81,8 +83,8 @@ Fault 报文结构(SOAP 1.2 §5.4):`Code/Subcode/Reason/Detail` 齐全,`Reason` 
 |------|:---:|------|
 | GetSystemDateAndTime | ✅ | UTC + 本地时间,`DateTimeType=NTP`;免认证 |
 | SetSystemDateAndTime | ◽ | 接受并返回空响应(虚拟设备无系统时钟可设) |
-| GetCapabilities | ✅ | Device/Media 两节;Media 含 `StreamingCapabilities(RTP_TCP, RTP_RTSP_TCP)`、快照;Events/PTZ/Analytics 不声明 |
-| GetServices | ✅ | Device + Media 两个 entry,含版本号;`IncludeCapability` 支持 |
+| GetCapabilities | ✅ | Device/Events/Media 三节;Events 声明 `WSPullPointSupport=true`;Media 含 `StreamingCapabilities(RTP_TCP, RTP_RTSP_TCP)`、快照;PTZ/Analytics 不声明 |
+| GetServices | ✅ | Device + Events + Media 三个 entry,含版本号;`IncludeCapability` 支持 |
 | GetServiceCapabilities | ✅ | Network/System/Security 最小合法集 |
 | GetDeviceInformation | ✅ | Manufacturer/Model/FirmwareVersion/SerialNumber/HardwareId,来自配置(有默认值) |
 | GetScopes | ✅ | 见上节 Scopes 列表(上游 500 的方法之一) |
@@ -122,7 +124,35 @@ Fault 报文结构(SOAP 1.2 §5.4):`Code/Subcode/Reason/Detail` 齐全,`Reason` 
 | GetOSDs | ◽ | 空列表 |
 | 其余未列方法 | ✗ | ActionNotSupported |
 
-## 6. RTSP 探测客户端(Web UI"测试连接")
+## 6. Event Service 方法清单
+
+路径 `POST /onvif/event_service`(在 `GetCapabilities` 的 `<tt:Events>` 与 `GetServices` 中声明)。只实现 **PullPoint** 模型(`WSPullPointSupport=true`;`WSSubscriptionPolicySupport` 与可暂停订阅为 `false`)。移动侦测状态来自报警接收器,见 [08-alarm-server.zh-CN.md](08-alarm-server.zh-CN.md)。Events 服务始终存在;从未收到报警的设备只会报告"无移动"。
+
+每个响应都带 WS-Addressing `<wsa:Action>` 头(WSDL 中的响应 action)。每个订阅拥有管理地址 `http://<Host>/onvif/subscription/<16 位 hex>`;PullMessages/Renew/Unsubscribe/SetSynchronizationPoint 既可发到该路径,也可发到 `/onvif/event_service` 并在 `wsa:To` 头里携带订阅地址。认证与其他服务相同(WSSE)。
+
+| 方法 | 状态 | 说明 |
+|------|:---:|------|
+| GetServiceCapabilities | ✅ | `WSPullPointSupport=true`,其余为 `false`,`MaxPullPoints=16` |
+| GetEventProperties | ✅ | TopicSet 声明下表两个 topic,各带 `MessageDescription IsProperty="true"`;TopicExpression 方言 ConcreteSet/Concrete;MessageContentFilter 方言 ItemFilter |
+| CreatePullPointSubscription | ✅ | `InitialTerminationTime` 支持 xsd:duration(`PT60S`)或绝对 dateTime;默认 60s,钳制在 10s–1h。`Filter` 接受但忽略(投递全部 topic)。每设备最多 16 个 pull point;创建第 17 个时淘汰最早到期的那个。创建时立即入队一条携带当前状态的 `Initialized` 消息 |
+| PullMessages | ✅ | 长轮询:有消息入队即返回,否则 `Timeout` 后返回(默认 10s,上限 60s;`PT0S` 立即返回)。`MessageLimit` 默认 10。每次调用按 TTL 续期订阅。响应含 `CurrentTime`/`TerminationTime` 及零或多个 `wsnt:NotificationMessage` |
+| Renew | ✅ | `TerminationTime` 为 duration 或 dateTime,钳制规则同上 |
+| Unsubscribe | ✅ | 删除订阅。幂等:未知 id(已过期、被淘汰或因重启丢失)同样返回成功,并记录日志 |
+| SetSynchronizationPoint | ✅ | 重新入队一条携带当前状态的 `Initialized` 消息 |
+| Subscribe / GetCurrentMessage / Seek / … | ✗ | ActionNotSupported |
+| 对未知或已过期订阅调用 PullMessages / Renew / SetSynchronizationPoint | ✅ | **复活**:若 id 格式合法(16 位小写 hex),则以同一 id、默认 60s TTL 重建 pull point,入队一条 `Initialized` 消息,调用照常处理。订阅只保存在内存中,否则重启、热重载、过期或淘汰都会让客户端失联(Unifi Protect 会一直拉取原地址,只会"最终"重新订阅)。唯一需要的状态就是 id,且由客户端持有,因此无需持久化。复活的订阅同样计入 16 个 pull point 上限 |
+| PullMessages / Renew / SetSynchronizationPoint 使用格式非法的订阅 id | ✗ | `env:Sender` / `ter:InvalidArgVal`,HTTP 400 |
+
+Topic(每次变化两者都发,`Dialect=…/ConcreteSet`):
+
+| Topic | Source SimpleItem | Data SimpleItem |
+|------|------|------|
+| `tns1:RuleEngine/CellMotionDetector/Motion` | `VideoSourceConfigurationToken=vsc`、`VideoAnalyticsConfigurationToken=vac`、`Rule=MotionDetectorRule` | `IsMotion`(xs:boolean) |
+| `tns1:VideoSource/MotionAlarm` | `Source=src` | `State`(xs:boolean) |
+
+`tt:Message` 带 `UtcTime` 与 `PropertyOperation`(订阅/同步点时为 `Initialized`,每次状态变化为 `Changed`)。每个订阅最多缓存 64 条消息,溢出时丢弃最旧的。
+
+## 7. RTSP 探测客户端(Web UI"测试连接")
 
 原生实现(不依赖 ffmpeg),按 RFC 2326:
 
@@ -131,7 +161,7 @@ Fault 报文结构(SOAP 1.2 §5.4):`Code/Subcode/Reason/Detail` 齐全,`Reason` 
 3. 解析 SDP(RFC 4566):`m=video/audio` 轨道、`a=rtpmap`(编码名 H264/H265/…)、`a=fmtp` 中 H264 `sprop-parameter-sets` 可解出 profile-level、`a=framerate`/`a=framesize`(如有);
 4. 输出结构化结果:`连通性 / 认证结果 / 状态码 / 编码 / 轨道数 / server 头`,UI 按类别显示错误(TCP 不通 ≠ 密码错 ≠ 路径 404)。
 
-## 7. 与上游对照的验收基准
+## 8. 与上游对照的验收基准
 
 实现完成后,自检(Web UI"ONVIF 自检"按钮,详见 04 文档)必须全绿:
 
@@ -144,4 +174,5 @@ Fault 报文结构(SOAP 1.2 §5.4):`Code/Subcode/Reason/Detail` 齐全,`Reason` 
 | GetNetworkInterfaces | ❌ 500 | ❌ | ✅ 200 |
 | GetDeviceInformation | — | ✅ | ✅ 200 |
 | GetProfiles / GetStreamUri / GetSnapshotUri | — | 部分 | ✅ 200 |
+| GetEventProperties / CreatePullPointSubscription | — | — | ✅ 200 |
 | 任意未实现方法 | 裸 500 | 裸 500 | 规范 ActionNotSupported Fault |

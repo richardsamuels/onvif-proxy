@@ -19,6 +19,14 @@ web:
   username: ""
   password: ""
 
+# Optional TVT / ENS XML alarm-server receiver (docs/08-alarm-server.md).
+# Point the NVR's alarm server at <proxy-ip>:8899; motionAlarm id N drives
+# devices[N-1] and is exposed as ONVIF PullPoint motion events.
+alarm:
+  enabled: false
+  port: 8899
+  hold_seconds: 60
+
 devices:
   - name: "Garage Camera"
     # uuid / mac / serial are generated and written back when left empty.

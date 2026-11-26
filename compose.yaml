@@ -29,6 +29,7 @@ services:
     #   - "8080:8080"   # web UI
     #   - "8081:8081"   # device 1 soap
     #   - "8554:8554"   # device 1 rtsp proxy
+    #   - "8899:8899"   # alarm receiver (when alarm.enabled)
 
 # networks:
 #   lan:

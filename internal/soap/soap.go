@@ -25,6 +25,11 @@ const (
 	NSMedia    = "http://www.onvif.org/ver10/media/wsdl"
 	NSSchema   = "http://www.onvif.org/ver10/schema"
 	NSError    = "http://www.onvif.org/ver10/error"
+	NSEvents   = "http://www.onvif.org/ver10/events/wsdl"
+	NSWSNT     = "http://docs.oasis-open.org/wsn/b-2"
+	NSWSA      = "http://www.w3.org/2005/08/addressing"
+	NSTopics   = "http://www.onvif.org/ver10/topics"
+	NSWSTOP    = "http://docs.oasis-open.org/wsn/t-1"
 )
 
 // ContentType is the SOAP 1.2 media type used for every response.
@@ -33,12 +38,14 @@ const ContentType = "application/soap+xml; charset=utf-8"
 // Request is a parsed SOAP request. Action is the local name of the first
 // child element of the Body (the ONVIF method), Namespace is that element's
 // namespace URI, Body is the raw innerxml of the Body (for parameter
-// extraction) and Security is the WSSE UsernameToken when present.
+// extraction), Security is the WSSE UsernameToken when present and To is the
+// WS-Addressing To header (empty when absent).
 type Request struct {
 	Action    string
 	Namespace string
 	Body      []byte
 	Security  *UsernameToken
+	To        string
 }
 
 // UsernameToken is a WS-Security UsernameToken as sent by ONVIF clients.
@@ -65,6 +72,7 @@ type wire struct {
 				Created string `xml:"Created"`
 			} `xml:"UsernameToken"`
 		} `xml:"Security"`
+		To string `xml:"To"`
 	} `xml:"Header"`
 	Body struct {
 		Inner []byte `xml:",innerxml"`
@@ -79,7 +87,7 @@ func ParseRequest(body []byte) (*Request, error) {
 		return nil, fmt.Errorf("soap: parse envelope: %w", err)
 	}
 
-	req := &Request{Body: w.Body.Inner}
+	req := &Request{Body: w.Body.Inner, To: strings.TrimSpace(w.Header.To)}
 	// The Body innerxml alone loses the namespace declarations inherited from
 	// the Envelope, so resolve the action element over the full document where
 	// the decoder can bind prefixes to their namespace URIs.
@@ -209,17 +217,34 @@ const envelopeHeader = `<?xml version="1.0" encoding="UTF-8"?>` +
 	` xmlns:tds="` + NSDevice + `"` +
 	` xmlns:trt="` + NSMedia + `"` +
 	` xmlns:tt="` + NSSchema + `"` +
-	` xmlns:ter="` + NSError + `">` +
-	`<env:Body>`
+	` xmlns:ter="` + NSError + `"` +
+	` xmlns:tev="` + NSEvents + `"` +
+	` xmlns:wsnt="` + NSWSNT + `"` +
+	` xmlns:wsa="` + NSWSA + `"` +
+	` xmlns:tns1="` + NSTopics + `"` +
+	` xmlns:wstop="` + NSWSTOP + `">`
 
 const envelopeFooter = `</env:Body></env:Envelope>`
 
 // Envelope wraps an already-rendered Body payload in a SOAP 1.2 envelope with
 // the fixed ONVIF namespace prefixes declared on the Envelope element.
 func Envelope(body string) []byte {
+	return EnvelopeWithHeader("", body)
+}
+
+// EnvelopeWithHeader is Envelope plus an env:Header whose already-rendered
+// children are header (omitted when empty). The Events service uses it for
+// the WS-Addressing Action header required by WS-BaseNotification.
+func EnvelopeWithHeader(header, body string) []byte {
 	var b bytes.Buffer
-	b.Grow(len(envelopeHeader) + len(body) + len(envelopeFooter))
+	b.Grow(len(envelopeHeader) + len(header) + len(body) + len(envelopeFooter) + 32)
 	b.WriteString(envelopeHeader)
+	if header != "" {
+		b.WriteString("<env:Header>")
+		b.WriteString(header)
+		b.WriteString("</env:Header>")
+	}
+	b.WriteString("<env:Body>")
 	b.WriteString(body)
 	b.WriteString(envelopeFooter)
 	return b.Bytes()

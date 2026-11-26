@@ -28,6 +28,7 @@
     │                           │  │ │ SOAP HTTP Server     │ │              │
     │                           │  │ │  - Device Service    │ │              │
     │                           │  │ │  - Media Service     │ │              │
+    │                           │  │ │  - Event Service     │ │              │
     │                           │  │ │  - /snapshot (JPEG)  │ │              │
     │  RTSP (TCP)               │  │ └──────────────────────┘ │              │
     ├───────────────────────────┼─▶│ ┌──────────────────────┐ │  TCP pass-   │    ┌──────────┐
@@ -56,6 +57,8 @@
 | **Virtual Device** | One virtual ONVIF camera = one SOAP HTTP port + one RTSP proxy port; holds this device's profile/encoding parameters/target RTSP address |
 | **SOAP layer** | Parses the SOAP Envelope (method name, WSSE header, parameters), routes to a handler, renders the XML response template; unified Fault generation |
 | **WS-Discovery** | A single UDP listener answers on behalf of all virtual devices; implements Hello/Bye/Probe→ProbeMatches |
+| **Event Service** | Per-device ONVIF PullPoint events (`/onvif/event_service`); holds the device's motion state and per-subscription queues |
+| **Alarm Receiver** | Optional HTTP listener (`alarm.port`) for TVT/ENS `SendAlarmStatus` pushes; maps `motionAlarm id=N` to `devices[N-1]` and drives its Event Service — see docs/08-alarm-server.md |
 | **RTSP TCP Proxy** | `io.Copy` bidirectional pass-through to the real camera's RTSP port; RTSP auth is end-to-end (client credentials go straight through to the real camera) |
 | **Web Server** | REST API + embedded UI; native RTSP probing (OPTIONS/DESCRIBE + Digest auth); invokes ffmpeg to provide snapshots and MJPEG preview; ONVIF self-test; embeds the `/mcp` endpoint, exposing 12 MCP tools (device CRUD, RTSP probe, snapshot, ONVIF self-test, etc.) — see docs/07-mcp.md for details |
 
@@ -104,6 +107,18 @@ AI client (e.g. Claude Code) ──POST /mcp (JSON-RPC)──▶ go-sdk (Streama
 
 See docs/07-mcp.md for the detailed tool list, authentication, and error semantics.
 
+### 3.5 Alarm → ONVIF Motion Events
+
+```
+NVR ──POST /SendAlarmStatus (motionAlarm id=N)──▶ Alarm Receiver (alarm.port)
+  └─ snapshot diff + hold timeout ──▶ devices[N-1] onvif.Server.SetMotion(active)
+       └─ queue "Changed" on every pull point
+Client ──CreatePullPointSubscription / PullMessages (long poll)──▶ Event Service
+  ◀── tns1:RuleEngine/CellMotionDetector/Motion + tns1:VideoSource/MotionAlarm
+```
+
+See docs/08-alarm-server.md and docs/02-onvif-spec.md §6.
+
 ## 4. Directory Layout (planned)
 
 ```
@@ -118,7 +133,9 @@ onvif-proxy/
 │   │   ├── device.go              # Device Service handlers
 │   │   ├── media.go               # Media Service handlers
 │   │   ├── templates/             # XML response templates (text/template)
+│   │   ├── events.go              # Event Service handlers (PullPoint subscriptions, motion events)
 │   │   └── server.go              # per-device HTTP server, routing, snapshot endpoint
+│   ├── alarm/                     # TVT/ENS SendAlarmStatus receiver (motion state, hold timeout)
 │   ├── discovery/                 # WS-Discovery UDP listener and message handling
 │   ├── rtspproxy/                 # TCP pass-through proxy
 │   ├── rtsp/                      # native RTSP probe client (OPTIONS/DESCRIBE, Digest, SDP parsing)

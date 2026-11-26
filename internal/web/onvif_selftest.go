@@ -21,6 +21,7 @@ const (
 	nsSOAP    = "http://www.w3.org/2003/05/soap-envelope"
 	nsDevice  = "http://www.onvif.org/ver10/device/wsdl"
 	nsMedia   = "http://www.onvif.org/ver10/media/wsdl"
+	nsEvents  = "http://www.onvif.org/ver10/events/wsdl"
 	nsSchema  = "http://www.onvif.org/ver10/schema"
 	nsWSSE    = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
 	nsWSU     = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
@@ -53,6 +54,7 @@ func (s *Server) handleTestONVIF(w http.ResponseWriter, r *http.Request) {
 func (s *Server) runONVIFSelfTest(ctx context.Context, dev *config.Device) []onvifCheck {
 	deviceURL := fmt.Sprintf("http://127.0.0.1:%d/onvif/device_service", dev.Ports.SOAP)
 	mediaURL := fmt.Sprintf("http://127.0.0.1:%d/onvif/media_service", dev.Ports.SOAP)
+	eventsURL := fmt.Sprintf("http://127.0.0.1:%d/onvif/event_service", dev.Ports.SOAP)
 
 	profileToken := ""
 	if p := dev.PrimaryStream(); p != nil {
@@ -79,6 +81,9 @@ func (s *Server) runONVIFSelfTest(ctx context.Context, dev *config.Device) []onv
 		{"GetProfiles", mediaURL, nsMedia, "", false},
 		{"GetStreamUri", mediaURL, nsMedia, streamSetup + "<trt:ProfileToken>" + xmlEscape(profileToken) + "</trt:ProfileToken>", false},
 		{"GetSnapshotUri", mediaURL, nsMedia, "<trt:ProfileToken>" + xmlEscape(profileToken) + "</trt:ProfileToken>", false},
+		{"GetEventProperties", eventsURL, nsEvents, "", false},
+		// Short-lived on purpose: the pull point is never polled and expires on its own.
+		{"CreatePullPointSubscription", eventsURL, nsEvents, "<tev:InitialTerminationTime>PT10S</tev:InitialTerminationTime>", false},
 	}
 
 	out := make([]onvifCheck, 0, len(calls)+1)
@@ -137,8 +142,11 @@ func (s *Server) soapCallFault(ctx context.Context, endpoint, ns, method, inner 
 // media parameters. A WSSE UsernameToken header is added when auth is non-nil.
 func buildEnvelope(ns, method, inner string, auth *config.Auth) []byte {
 	prefix := "tds"
-	if ns == nsMedia {
+	switch ns {
+	case nsMedia:
 		prefix = "trt"
+	case nsEvents:
+		prefix = "tev"
 	}
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)

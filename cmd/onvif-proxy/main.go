@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Aiaid/onvif-proxy/internal/alarm"
 	"github.com/Aiaid/onvif-proxy/internal/config"
 	"github.com/Aiaid/onvif-proxy/internal/discovery"
 	"github.com/Aiaid/onvif-proxy/internal/mediautil"
@@ -195,17 +196,19 @@ type generation struct {
 	tasks     []generationTask
 	states    map[string]*deviceState
 	caches    map[string]*mediautil.Cache
+	servers   map[string]*onvif.Server // by device UUID
 	activated bool
 }
 
 func (m *manager) prepareGeneration(parent context.Context, cfg *config.Config, advertiseIP string) (*generation, error) {
 	genCtx, cancel := context.WithCancel(parent)
 	gen := &generation{
-		ctx:    genCtx,
-		cancel: cancel,
-		done:   make(chan struct{}),
-		states: make(map[string]*deviceState, len(cfg.Devices)),
-		caches: make(map[string]*mediautil.Cache, len(cfg.Devices)),
+		ctx:     genCtx,
+		cancel:  cancel,
+		done:    make(chan struct{}),
+		states:  make(map[string]*deviceState, len(cfg.Devices)),
+		caches:  make(map[string]*mediautil.Cache, len(cfg.Devices)),
+		servers: make(map[string]*onvif.Server, len(cfg.Devices)),
 	}
 	lc := net.ListenConfig{}
 
@@ -228,6 +231,7 @@ func (m *manager) prepareGeneration(parent context.Context, cfg *config.Config, 
 				return m.snapshot(ctx, dev, streamName, cache)
 			},
 		})
+		gen.servers[dev.UUID] = srv
 		gen.tasks = append(gen.tasks, generationTask{
 			label: fmt.Sprintf("device %q SOAP server", dev.Name),
 			state: state,
@@ -253,6 +257,44 @@ func (m *manager) prepareGeneration(parent context.Context, cfg *config.Config, 
 				},
 			})
 		}
+	}
+
+	if cfg.Alarm.Enabled {
+		port := cfg.Alarm.ListenPort()
+		alarmLn, err := lc.Listen(genCtx, "tcp4", ":"+strconv.Itoa(port))
+		if err != nil {
+			gen.closePrepared()
+			return nil, fmt.Errorf("alarm receiver port %d: %w", port, err)
+		}
+		devices := cfg.Devices
+		var warnedMu sync.Mutex
+		warned := map[int]bool{}
+		recv := alarm.NewServer(alarm.Options{
+			Hold: time.Duration(cfg.Alarm.Hold()) * time.Second,
+			OnChange: func(channel int, active bool) {
+				if channel < 1 || channel > len(devices) {
+					warnedMu.Lock()
+					first := !warned[channel]
+					warned[channel] = true
+					warnedMu.Unlock()
+					if first {
+						log.Printf("alarm: motion channel %d has no device (devices[%d] does not exist); ignoring it", channel, channel-1)
+					}
+					return
+				}
+				dev := devices[channel-1]
+				log.Printf("alarm: channel %d -> device %q motion=%v", channel, dev.Name, active)
+				gen.servers[dev.UUID].SetMotion(active)
+			},
+		})
+		gen.tasks = append(gen.tasks, generationTask{
+			label: fmt.Sprintf("alarm receiver :%d", port),
+			state: &deviceState{running: true},
+			ln:    alarmLn,
+			run: func(ctx context.Context) error {
+				return recv.Serve(ctx, alarmLn)
+			},
+		})
 	}
 	return gen, nil
 }
@@ -531,14 +573,17 @@ func (m *manager) Devices() []web.DeviceRuntime {
 	defer m.mu.RUnlock()
 	out := make([]web.DeviceRuntime, 0, len(m.cfg.Devices))
 	for _, d := range m.cfg.Devices {
-		var running bool
+		var running, motion bool
 		var runErr string
 		if m.gen != nil {
 			if state := m.gen.states[d.UUID]; state != nil {
 				running, runErr = state.snapshot()
 			}
+			if srv := m.gen.servers[d.UUID]; srv != nil {
+				motion = srv.Motion()
+			}
 		}
-		out = append(out, web.DeviceRuntime{Device: d, Running: running, Error: runErr})
+		out = append(out, web.DeviceRuntime{Device: d, Running: running, Error: runErr, Motion: motion})
 	}
 	return out
 }

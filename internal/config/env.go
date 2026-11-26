@@ -56,6 +56,15 @@ func ApplyEnvOverrides(cfg *Config) ([]string, error) {
 	setPort("ONVIF_WEB_PORT", &cfg.Web.Port, "web.port")
 	setStr("ONVIF_WEB_USERNAME", &cfg.Web.Username, "web.username")
 	setStr("ONVIF_WEB_PASSWORD", &cfg.Web.Password, "web.password")
+	if v := os.Getenv("ONVIF_ALARM_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err != nil {
+			errs = append(errs, fmt.Sprintf("ONVIF_ALARM_ENABLED: %q is not a boolean", v))
+		} else {
+			cfg.Alarm.Enabled = b
+			applied = append(applied, "ONVIF_ALARM_ENABLED overrides alarm.enabled")
+		}
+	}
+	setPort("ONVIF_ALARM_PORT", &cfg.Alarm.Port, "alarm.port")
 
 	if len(errs) > 0 {
 		return applied, &ValidationError{Problems: errs}

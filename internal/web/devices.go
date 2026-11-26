@@ -40,6 +40,7 @@ type deviceView struct {
 	SOAPPort  int           `json:"soap_port"`
 	RTSPPort  int           `json:"rtsp_port"`
 	Running   bool          `json:"running"`
+	Motion    bool          `json:"motion"`
 	Error     string        `json:"error,omitempty"`
 	AuthUser  string        `json:"auth_user"` // ONVIF WSSE username, "" when auth is off
 	Endpoints endpointsView `json:"endpoints"`
@@ -94,6 +95,7 @@ func (s *Server) deviceViews() []deviceView {
 			SOAPPort: dev.Ports.SOAP,
 			RTSPPort: dev.Ports.RTSP,
 			Running:  dr.Running,
+			Motion:   dr.Motion,
 			Error:    dr.Error,
 			AuthUser: authUser,
 			Endpoints: endpointsView{

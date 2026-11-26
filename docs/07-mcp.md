@@ -35,7 +35,7 @@ self-test on it."
 - Auth: reuses `withAuth` — when `web.username` is configured, site-wide
   Basic auth applies and `/mcp` is automatically covered as well.
 - Go version: the SDK requires Go ≥ 1.25; `go.mod` and the Dockerfile build
-  image were bumped in tandem (`golang:1.26.5-alpine`, see docs/05).
+  image were bumped in tandem (`golang:1.26.11-alpine`, see docs/05).
 
 Client setup example:
 

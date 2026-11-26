@@ -9,6 +9,8 @@ Concrete points where this project "does things properly per spec." Specificatio
 | ONVIF Core Specification | Device service, discovery, security, Fault semantics |
 | ONVIF Media Service Specification (ver10) | Media service, Profile/StreamUri/SnapshotUri |
 | ONVIF Profile S | Baseline for judging the mandatory feature set |
+| ONVIF Event Service Specification / OASIS WS-BaseNotification 1.3 | Events service, PullPoint subscriptions, motion topics |
+| W3C WS-Addressing 1.0 | `wsa:Action` / `wsa:To` headers on event messages |
 | W3C SOAP 1.2 | Envelope structure, Fault structure, HTTP status code mapping |
 | WS-Discovery (2005/04 draft, the version ONVIF specifies) | UDP 3702 multicast discovery |
 | OASIS WS-Security UsernameToken Profile 1.0 | WSSE PasswordDigest authentication |
@@ -28,7 +30,7 @@ Concrete points where this project "does things properly per spec." Specificatio
 ### 1.2 Response
 
 - `Content-Type: application/soap+xml; charset=utf-8` uniformly.
-- Response templates are hand-written element by element against the ONVIF WSDL definitions, with namespace prefixes fixed and declared on the Envelope (`tds`/`trt`/`tt`/`ter`, etc.).
+- Response templates are hand-written element by element against the ONVIF WSDL definitions, with namespace prefixes fixed and declared on the Envelope (`tds`/`trt`/`tt`/`ter`/`tev`/`wsnt`/`wsa`/`tns1`/`wstop`). Event responses also carry a `<wsa:Action>` header..
 - All dynamic fields are XML-escaped.
 
 ### 1.3 Fault Semantics (the key differentiator)
@@ -81,8 +83,8 @@ Path `POST /onvif/device_service`. ✅ = fully implemented, ◽ = empty/fixed-va
 |------|:---:|------|
 | GetSystemDateAndTime | ✅ | UTC + local time, `DateTimeType=NTP`; unauthenticated |
 | SetSystemDateAndTime | ◽ | Accepted, returns an empty response (a virtual device has no system clock to set) |
-| GetCapabilities | ✅ | Device/Media sections; Media includes `StreamingCapabilities(RTP_TCP, RTP_RTSP_TCP)`, snapshot; Events/PTZ/Analytics are not declared |
-| GetServices | ✅ | Device + Media entries, with version numbers; `IncludeCapability` supported |
+| GetCapabilities | ✅ | Device/Events/Media sections; Events declares `WSPullPointSupport=true`; Media includes `StreamingCapabilities(RTP_TCP, RTP_RTSP_TCP)`, snapshot; PTZ/Analytics are not declared |
+| GetServices | ✅ | Device + Events + Media entries, with version numbers; `IncludeCapability` supported |
 | GetServiceCapabilities | ✅ | Minimal valid set for Network/System/Security |
 | GetDeviceInformation | ✅ | Manufacturer/Model/FirmwareVersion/SerialNumber/HardwareId, from config (with defaults) |
 | GetScopes | ✅ | See the Scopes list above (one of the methods that 500s upstream) |
@@ -122,7 +124,35 @@ Data model (**multi-Profile**, count determined by the configured `streams[]`, N
 | GetOSDs | ◽ | Empty list |
 | All other methods not listed | ✗ | ActionNotSupported |
 
-## 6. RTSP Probe Client (Web UI "Test Connection")
+## 6. Event Service Method List
+
+Path `POST /onvif/event_service` (advertised in `GetCapabilities` `<tt:Events>` and `GetServices`). Only the **PullPoint** model is implemented (`WSPullPointSupport=true`; `WSSubscriptionPolicySupport` and pausable subscriptions are `false`). Motion state comes from the alarm receiver, see [08-alarm-server.md](08-alarm-server.md). The Events service is always present; a device that never receives an alarm simply reports "no motion".
+
+Every response carries a WS-Addressing `<wsa:Action>` header with the WSDL response action. Each subscription gets a manager address `http://<Host>/onvif/subscription/<16 hex>`; PullMessages/Renew/Unsubscribe/SetSynchronizationPoint are accepted either at that path, or at `/onvif/event_service` with the subscription address in the `wsa:To` header. Authentication is the same WSSE check as the other services.
+
+| Method | Status | Notes |
+|------|:---:|------|
+| GetServiceCapabilities | ✅ | `WSPullPointSupport=true`, others `false`, `MaxPullPoints=16` |
+| GetEventProperties | ✅ | TopicSet declares the two topics below, each with a `MessageDescription IsProperty="true"`; TopicExpression dialects ConcreteSet/Concrete; MessageContentFilter dialect ItemFilter |
+| CreatePullPointSubscription | ✅ | `InitialTerminationTime` as xsd:duration (`PT60S`) or absolute dateTime; default 60s, clamped to 10s–1h. `Filter` is accepted and ignored (all topics are delivered). At most 16 pull points per device; creating a 17th evicts the one that expires soonest. An `Initialized` message with the current state is queued immediately |
+| PullMessages | ✅ | Long poll: returns as soon as a message is queued, else after `Timeout` (default 10s, max 60s; `PT0S` returns immediately). `MessageLimit` default 10. Each call extends the subscription by its TTL. Response has `CurrentTime`/`TerminationTime` and zero or more `wsnt:NotificationMessage` |
+| Renew | ✅ | `TerminationTime` as duration or dateTime, same clamping |
+| Unsubscribe | ✅ | Deletes the subscription. Idempotent: an unknown id (already expired, evicted, or lost to a restart) also succeeds, and is logged |
+| SetSynchronizationPoint | ✅ | Re-queues an `Initialized` message with the current state |
+| Subscribe / GetCurrentMessage / Seek / … | ✗ | ActionNotSupported |
+| PullMessages / Renew / SetSynchronizationPoint on an unknown or expired subscription | ✅ | **Revived**: if the id is well-formed (16 lowercase hex), a pull point is recreated under the same id with the default 60s TTL, an `Initialized` message is queued, and the call proceeds normally. Subscriptions live only in memory, so a restart, hot reload, expiry or eviction would otherwise strand clients (Unifi Protect keeps pulling its address and re-subscribes only "eventually"). The id is the only state needed and the client holds it, so nothing is persisted. Revivals count toward the 16 pull-point cap |
+| PullMessages / Renew / SetSynchronizationPoint with a malformed subscription id | ✗ | `env:Sender` / `ter:InvalidArgVal`, HTTP 400 |
+
+Topics (both emitted for each change, `Dialect=…/ConcreteSet`):
+
+| Topic | Source SimpleItem | Data SimpleItem |
+|------|------|------|
+| `tns1:RuleEngine/CellMotionDetector/Motion` | `VideoSourceConfigurationToken=vsc`, `VideoAnalyticsConfigurationToken=vac`, `Rule=MotionDetectorRule` | `IsMotion` (xs:boolean) |
+| `tns1:VideoSource/MotionAlarm` | `Source=src` | `State` (xs:boolean) |
+
+`tt:Message` carries `UtcTime` and `PropertyOperation` (`Initialized` on subscribe/sync point, `Changed` on each transition). Each subscription queues at most 64 messages; the oldest are dropped on overflow.
+
+## 7. RTSP Probe Client (Web UI "Test Connection")
 
 A native implementation (no ffmpeg dependency), per RFC 2326:
 
@@ -131,7 +161,7 @@ A native implementation (no ffmpeg dependency), per RFC 2326:
 3. Parse the SDP (RFC 4566): `m=video/audio` tracks, `a=rtpmap` (codec name H264/H265/…), H264 `sprop-parameter-sets` in `a=fmtp` can be decoded for profile-level, `a=framerate`/`a=framesize` (if present);
 4. Output a structured result: `connectivity / auth result / status code / codec / track count / server header`; the UI displays errors by category (TCP unreachable ≠ wrong password ≠ path 404).
 
-## 7. Acceptance Baseline vs. Upstream
+## 8. Acceptance Baseline vs. Upstream
 
 Once implementation is complete, the self-check (Web UI "ONVIF Self-Check" button, see doc 04) must be all-green:
 
@@ -144,4 +174,5 @@ Once implementation is complete, the self-check (Web UI "ONVIF Self-Check" butto
 | GetNetworkInterfaces | ❌ 500 | ❌ | ✅ 200 |
 | GetDeviceInformation | — | ✅ | ✅ 200 |
 | GetProfiles / GetStreamUri / GetSnapshotUri | — | Partial | ✅ 200 |
+| GetEventProperties / CreatePullPointSubscription | — | — | ✅ 200 |
 | Any unimplemented method | Bare 500 | Bare 500 | Conformant ActionNotSupported Fault |

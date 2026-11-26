@@ -21,6 +21,7 @@ import (
 type Config struct {
 	Server  ServerConfig `yaml:"server"`
 	Web     WebConfig    `yaml:"web"`
+	Alarm   AlarmConfig  `yaml:"alarm,omitempty"`
 	Devices []*Device    `yaml:"devices"`
 }
 
@@ -41,6 +42,39 @@ type WebConfig struct {
 }
 
 func (w WebConfig) IsEnabled() bool { return w.Enabled == nil || *w.Enabled }
+
+// AlarmConfig configures the TVT/ENS XML alarm-server receiver
+// (POST /SendAlarmStatus, docs/08-alarm-server.md). motionAlarm id=N drives
+// the ONVIF motion state of Devices[N-1].
+type AlarmConfig struct {
+	Enabled bool `yaml:"enabled,omitempty"`
+	// Port is the HTTP listen port. 0 = DefaultAlarmPort.
+	Port int `yaml:"port,omitempty"`
+	// HoldSeconds clears a channel that has not been re-reported active for
+	// this long. nil = DefaultAlarmHoldSeconds; 0 disables the timeout.
+	HoldSeconds *int `yaml:"hold_seconds,omitempty"`
+}
+
+const (
+	DefaultAlarmPort        = 8899
+	DefaultAlarmHoldSeconds = 60
+)
+
+// ListenPort returns the configured port or DefaultAlarmPort.
+func (a AlarmConfig) ListenPort() int {
+	if a.Port == 0 {
+		return DefaultAlarmPort
+	}
+	return a.Port
+}
+
+// Hold returns the safety timeout in seconds (0 = disabled).
+func (a AlarmConfig) Hold() int {
+	if a.HoldSeconds == nil {
+		return DefaultAlarmHoldSeconds
+	}
+	return *a.HoldSeconds
+}
 
 type Device struct {
 	Name     string    `yaml:"name"`
@@ -398,6 +432,15 @@ func (c *Config) Validate() error {
 	}
 	if (c.Web.Username == "") != (c.Web.Password == "") {
 		add("web: username and password must be set together")
+	}
+	if c.Alarm.Port < 0 {
+		add("alarm: port %d out of range", c.Alarm.Port)
+	}
+	if c.Alarm.Enabled {
+		claim(c.Alarm.ListenPort(), "alarm")
+	}
+	if c.Alarm.HoldSeconds != nil && *c.Alarm.HoldSeconds < 0 {
+		add("alarm.hold_seconds: must not be negative")
 	}
 
 	names := map[string]bool{}

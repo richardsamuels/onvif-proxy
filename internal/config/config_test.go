@@ -278,3 +278,42 @@ func TestPreparePreservesOriginalBytesOrAddsIdentities(t *testing.T) {
 		t.Fatalf("prepared YAML does not parse: %v", err)
 	}
 }
+
+func TestAlarmConfig(t *testing.T) {
+	cfg, err := Parse([]byte(validConfigYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Alarm.Enabled || cfg.Alarm.ListenPort() != DefaultAlarmPort || cfg.Alarm.Hold() != DefaultAlarmHoldSeconds {
+		t.Fatalf("defaults: %+v port=%d hold=%d", cfg.Alarm, cfg.Alarm.ListenPort(), cfg.Alarm.Hold())
+	}
+	out, err := marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "alarm") {
+		t.Fatalf("zero alarm section should be omitted:\n%s", out)
+	}
+
+	cfg, err = Parse([]byte(validConfigYAML + "alarm:\n  enabled: true\n  port: 9000\n  hold_seconds: 0\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Alarm.Enabled || cfg.Alarm.ListenPort() != 9000 || cfg.Alarm.Hold() != 0 {
+		t.Fatalf("explicit: %+v", cfg.Alarm)
+	}
+
+	for name, extra := range map[string]string{
+		"port conflict": "alarm:\n  enabled: true\n  port: 8081\n",
+		"negative hold": "alarm:\n  hold_seconds: -1\n",
+		"bad port":      "alarm:\n  enabled: true\n  port: 70000\n",
+	} {
+		if _, err := Parse([]byte(validConfigYAML + extra)); err == nil {
+			t.Errorf("%s: expected validation error", name)
+		}
+	}
+	// A disabled receiver does not claim its port.
+	if _, err := Parse([]byte(validConfigYAML + "alarm:\n  enabled: false\n  port: 8081\n")); err != nil {
+		t.Errorf("disabled alarm port should not conflict: %v", err)
+	}
+}

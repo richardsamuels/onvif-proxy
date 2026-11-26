@@ -15,6 +15,7 @@ An **RTSP → ONVIF virtual camera proxy** written in Go. It wraps any existing 
 - **Honest codec metadata** — each profile declares its configured H.264, JPEG/MJPEG, or MPEG-4 encoder consistently across profiles, options, and guaranteed-instance counts. H.265/HEVC is rejected because ONVIF Profile S does not define an H.265 encoder type.
 - **Snapshot support** — `GetSnapshotUri` works out of the box: pass through the real camera's HTTP snapshot URL when it has one, or let the built-in ffmpeg grabber pull a JPEG frame straight from the RTSP stream (with short-TTL caching). This fills a gap left open by the upstream projects.
 - **WS-Discovery** — multicast discovery on UDP 3702 with Hello / Bye / ProbeMatches, so clients find the virtual devices automatically.
+- **Motion events from TVT / ENS NVRs** — an optional built-in alarm server receives the NVR's XML `SendAlarmStatus` pushes and turns `motionAlarm id=N` into ONVIF PullPoint motion events (`tns1:RuleEngine/CellMotionDetector/Motion`, `tns1:VideoSource/MotionAlarm`) on the N-th virtual device (see [docs/08-alarm-server.md](docs/08-alarm-server.md)).
 - **Zero-transcode RTSP proxy** — a per-device TCP passthrough proxy forwards the stream bytes untouched to the real camera; no decoding, no CPU cost. ffmpeg is only used for snapshots and UI previews.
 - **Web UI** — besides the YAML config file, a small embedded web backend lets you edit the config online, probe RTSP connectivity (native RTSP client with Digest/Basic auth and SDP parsing), grab snapshots, watch a live MJPEG preview, and run an ONVIF self-test against the virtual device itself.
 - **Transactional hot reload** — configuration changes validate and reserve their listeners before being committed; bind or persistence failures restore the previous runtime and leave the old config file intact.
@@ -29,12 +30,13 @@ Design docs (bilingual — each has a `.zh-CN.md` counterpart, e.g. [docs/01-arc
 | Doc | Contents |
 |-----|----------|
 | [docs/01-architecture.md](docs/01-architecture.md) | Architecture, module layout, data flows, directory structure |
-| [docs/02-onvif-spec.md](docs/02-onvif-spec.md) | ONVIF / SOAP / WS-Discovery / WSSE conformance design, method matrix, fault semantics |
+| [docs/02-onvif-spec.md](docs/02-onvif-spec.md) | ONVIF / SOAP / WS-Discovery / WSSE conformance design, Device/Media/Events method matrix, fault semantics |
 | [docs/03-config.md](docs/03-config.md) | YAML config format and validation rules |
 | [docs/04-web-api.md](docs/04-web-api.md) | Web backend REST API and UI design |
 | [docs/05-deployment.md](docs/05-deployment.md) | Docker / macvlan deployment |
 | [docs/06-internal-api.md](docs/06-internal-api.md) | Exported package interfaces and integration contracts |
 | [docs/07-mcp.md](docs/07-mcp.md) | Built-in MCP server endpoint (`/mcp`), tool catalog, implementation contract |
+| [docs/08-alarm-server.md](docs/08-alarm-server.md) | TVT / ENS XML alarm-server receiver and its mapping to ONVIF motion events |
 
 ## Quick start (Docker)
 

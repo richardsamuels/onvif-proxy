@@ -4,7 +4,7 @@
 
 The configuration file is YAML, with a default path of `./config.yaml` (overridable via the `-config` flag or the `CONFIG` environment variable). It is created and rewritten with owner-only permissions (`0600`) because it can contain RTSP and Web passwords. Edits made through the Web UI are validated and then **atomically written back** to the same file; auto-generated persistent fields (uuid, mac) are also written back. A small set of global fields support runtime overrides via environment variables (see Section 3), which makes it easy to change config in Docker deployments without mounting a file.
 
-Hot reload applies device settings plus `server.advertise_ip`, `server.discovery`, and Web credentials live. Changing `web.enabled` or `web.port` through the API requires a process restart, so such an API update is rejected without writing the file. Startup-time environment overrides remain supported for all listed fields, including `ONVIF_WEB_ENABLED` and `ONVIF_WEB_PORT`.
+Hot reload applies device settings plus `server.advertise_ip`, `server.discovery`, the `alarm` section, and Web credentials live (a reload resets every device's motion state to inactive). Changing `web.enabled` or `web.port` through the API requires a process restart, so such an API update is rejected without writing the file. Startup-time environment overrides remain supported for all listed fields, including `ONVIF_WEB_ENABLED` and `ONVIF_WEB_PORT`.
 
 ## 1. Full example
 
@@ -24,6 +24,12 @@ web:
   # HTTP Basic auth for the Web UI; leave empty to disable
   username: ""
   password: ""
+
+# TVT / ENS XML alarm-server receiver (see doc 08). The whole block can be omitted (= disabled).
+alarm:
+  enabled: false
+  port: 8899                     # The NVR POSTs /SendAlarmStatus here; motionAlarm id N -> devices[N-1]
+  hold_seconds: 60               # Clear a channel not re-reported active for this long; 0 = never
 
 # Virtual device list — each entry = one ONVIF camera
 devices:
@@ -100,6 +106,16 @@ devices:
 | `advertise_ip` | string | auto-detected | A valid IPv4 address written into XAddrs / StreamUri / SnapshotUri. **URIs inside HTTP responses preferentially use the request's Host header** (NAT-friendly); this field is mainly used for WS-Discovery |
 | `discovery` | bool | true | Whether to start UDP 3702 |
 
+### alarm
+
+| Field | Type | Default | Description |
+|------|------|------|------|
+| `enabled` | bool | false | Start the `SendAlarmStatus` receiver (see [08-alarm-server.md](08-alarm-server.md)) |
+| `port` | int | 8899 | Receiver TCP port, 1-65535; when enabled it is included in the global port-conflict check |
+| `hold_seconds` | int | 60 | Safety timeout: a channel not re-reported `true` for this many seconds is cleared. `0` disables the timeout; negative values are rejected |
+
+Channel mapping: `motionAlarm id="N"` drives `devices[N-1]`, so device order in the list matters. Ids beyond the list are logged once and ignored.
+
 ### devices[]
 
 | Field | Required | Validation |
@@ -134,10 +150,11 @@ The YAML parser accepts exactly one document. Null device/stream entries, unknow
 | web | 8080 |
 | device soap | 8081, 8082, … |
 | device rtsp | 8554, 8555, … |
+| alarm receiver | 8899 |
 
 ## 3. Environment variable overrides
 
-Aimed at Docker/compose scenarios: global fields in the `server` and `web` sections can be overridden via environment variables, avoiding the need to pre-write sensitive information into a mounted volume.
+Aimed at Docker/compose scenarios: global fields in the `server`, `web`, and `alarm` sections can be overridden via environment variables, avoiding the need to pre-write sensitive information into a mounted volume.
 
 | Environment variable | Overridden field | Value |
 |------|------|------|
@@ -148,6 +165,8 @@ Aimed at Docker/compose scenarios: global fields in the `server` and `web` secti
 | `ONVIF_WEB_PORT` | `web.port` | 1-65535 |
 | `ONVIF_WEB_USERNAME` | `web.username` | String |
 | `ONVIF_WEB_PASSWORD` | `web.password` | String |
+| `ONVIF_ALARM_ENABLED` | `alarm.enabled` | `true` / `false` |
+| `ONVIF_ALARM_PORT` | `alarm.port` | 1-65535 |
 
 Semantics:
 

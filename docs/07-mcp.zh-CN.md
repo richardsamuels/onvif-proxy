@@ -28,7 +28,7 @@ Desktop 等),使其可以直接管理本代理:例如"帮我把这个 RTSP 流�
 - 认证:复用 `withAuth` —— 配置了 `web.username` 时全站 Basic 认证,`/mcp`
   自动被覆盖。
 - Go 版本:SDK 要求 Go ≥ 1.25,go.mod 与 Dockerfile 构建镜像同步上调
-  (`golang:1.26.5-alpine`,见 docs/05)。
+  (`golang:1.26.11-alpine`,见 docs/05)。
 
 客户端接入示例:
 

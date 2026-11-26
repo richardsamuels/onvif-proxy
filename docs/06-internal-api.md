@@ -9,7 +9,10 @@ Module path: `github.com/Aiaid/onvif-proxy`. Dependency rules: every package may
 ## internal/config (already implemented, read-only reference)
 
 ```go
-type Config struct { Server ServerConfig; Web WebConfig; Devices []*Device }
+type Config struct { Server ServerConfig; Web WebConfig; Alarm AlarmConfig; Devices []*Device }
+type AlarmConfig struct { Enabled bool; Port int; HoldSeconds *int } // yaml: alarm.enabled/port/hold_seconds
+func (a AlarmConfig) ListenPort() int // Port, or DefaultAlarmPort (8899) when 0
+func (a AlarmConfig) Hold() int       // seconds; nil -> DefaultAlarmHoldSeconds (60), 0 = disabled
 func Load(path string) (*Config, error)          // read + validate + generate uuid/mac and persist
 func Parse(data []byte) (*Config, error)         // strict parse + validate (for dry-run)
 func Prepare(data []byte) (*Config, []byte, error) // parse + validate + generate identity; returns canonical YAML without writing
@@ -48,6 +51,7 @@ type Request struct {
     Namespace string            // the namespace URI of that element
     Body      []byte            // the Body's innerxml (for extracting parameters)
     Security  *UsernameToken    // nil when there is no WSSE header
+    To        string            // WS-Addressing To header (empty when absent); used to route PullPoint calls
 }
 type UsernameToken struct { Username, Password, PasswordType, Nonce, Created string }
 
@@ -60,6 +64,9 @@ func (t *UsernameToken) Verify(username, password string, clockSkew time.Duratio
 
 // Response rendering: body is the already-rendered inner XML of the Body; the Envelope/namespaces are added uniformly by this layer
 func Envelope(body string) []byte
+// Same, with header (already-rendered inner XML of env:Header, e.g. <wsa:Action>); empty header = no env:Header
+func EnvelopeWithHeader(header, body string) []byte
+// Namespace constants include NSEvents (tev), NSWSNT (wsnt), NSWSA (wsa), NSTopics (tns1), NSWSTOP (wstop)
 
 // Fault: writes to w (sets Content-Type and HTTP status code) and returns
 // code: "Sender"/"Receiver"; subcode e.g. "ter:ActionNotSupported"
@@ -72,9 +79,9 @@ func WriteInvalidArg(w http.ResponseWriter, reason string)         // Sender, HT
 func XMLEscape(s string) string
 ```
 
-Envelope uniformly declares the namespace prefixes `env` (SOAP 1.2), `tds`, `trt`, `tt`, `ter`; `wsnt` is not needed. The Fault structure contains Code/Subcode/Reason (xml:lang="en").
+Envelope uniformly declares the namespace prefixes `env` (SOAP 1.2), `tds`, `trt`, `tt`, `ter`, `tev`, `wsnt`, `wsa`, `tns1`, `wstop`. The Fault structure contains Code/Subcode/Reason (xml:lang="en").
 
-## internal/onvif (Device + Media services, one HTTP server per device)
+## internal/onvif (Device + Media + Events services, one HTTP server per device)
 
 ```go
 package onvif // allowed imports: internal/config, internal/soap
@@ -88,15 +95,39 @@ type Options struct {
 
 func NewServer(dev *config.Device, opts Options) *Server
 func (s *Server) Run(ctx context.Context) error // listens on dev.Ports.SOAP; shuts down gracefully when ctx is canceled
-func (s *Server) Serve(ctx context.Context, ln net.Listener) error // serves an already-bound listener
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error // serves an already-bound listener; releases pending PullMessages on shutdown
+func (s *Server) SetMotion(active bool) // updates motion state; on change queues a "Changed" event on every live pull point (safe for concurrent use)
+func (s *Server) Motion() bool          // current motion state
 
 // Routes:
 //   POST /onvif/device_service
 //   POST /onvif/media_service
+//   POST /onvif/event_service
+//   POST /onvif/subscription/{id}               (PullPoint subscription manager)
 //   GET  /onvif/snapshot?token=<profileToken>   (HTTP Basic required when dev.Auth is configured)
 ```
 
-Behavioral requirements (see docs/02-onvif-spec.md for details): the method matrix follows sections 4/5 of document 02; `GetSystemDateAndTime` requires no authentication; when `dev.Auth == nil` everything is allowed through unauthenticated; PasswordDigest requires a fresh valid timestamp/nonce and rejects nonce replay; URI construction prefers `r.Host`; unknown methods → `soap.WriteActionNotSupported`. SOAP bodies are capped at 1 MiB and HTTP header/read/idle timeouts are bounded.
+Behavioral requirements (see docs/02-onvif-spec.md for details): the method matrix follows sections 4/5/6 of document 02; `GetSystemDateAndTime` requires no authentication; when `dev.Auth == nil` everything is allowed through unauthenticated; PasswordDigest requires a fresh valid timestamp/nonce and rejects nonce replay; URI construction prefers `r.Host`; unknown methods → `soap.WriteActionNotSupported`. SOAP bodies are capped at 1 MiB and HTTP header/read/idle timeouts are bounded.
+
+## internal/alarm (TVT / ENS XML alarm-server receiver)
+
+```go
+package alarm // allowed imports: standard library only
+
+type Options struct {
+    Hold     time.Duration                 // clear a channel not re-reported true for this long; 0 = never
+    OnChange func(channel int, active bool) // called without internal locks for each transition; channel = 1-based motionAlarm id
+}
+
+func NewServer(opts Options) *Server
+func Parse(body []byte) (map[int]bool, error) // motionAlarm id -> state; bad entries skipped; malformed/empty XML -> error
+func (s *Server) Apply(motion map[int]bool)   // snapshot semantics: true = active, false/absent = inactive; transitions sorted by channel
+func (s *Server) Active() []int               // sorted active channels
+func (s *Server) Handler() http.Handler       // POST /SendAlarmStatus; other methods 405, other paths 404
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error // serves an already-bound listener and runs the hold-timeout loop (1s tick)
+```
+
+Wire format and state semantics: docs/08-alarm-server.md. Success → 200 `<config status="success"/>`; malformed or >64 KiB body → 400 `<config status="failed" errorCode="2"/>`. No authentication.
 
 ## internal/discovery (WS-Discovery)
 
@@ -211,7 +242,7 @@ type Backend interface {
     DiscoveryLog() []discovery.LogEntry
     Status() Status
 }
-type DeviceRuntime struct { Device *config.Device; Running bool; Error string }
+type DeviceRuntime struct { Device *config.Device; Running bool; Error string; Motion bool }
 type Status struct {
     Version, AdvertiseIP string
     UptimeSeconds        int64
@@ -232,4 +263,4 @@ See docs/04-web-api.md for REST routes and semantics (`/api/config`, `/api/devic
 
 ## cmd/onvif-proxy (main, integration layer, implemented last)
 
-Responsibilities: flag parsing (`-config`, default `./config.yaml`; `-version`) → `config.Load` → assemble the Manager (implements `web.Backend`; starts an onvif.Server + rtspproxy per device; discovery.Server; snapshot function = pass-through or mediautil.Grab + Cache) → signal handling and transactional hot reload. Reload first prepares the candidate and synchronously pre-binds every SOAP/RTSP/discovery listener. A bind or persistence failure restores the old generation and leaves the old file/runtime usable; successful persistence uses a same-directory atomic rename with mode 0600. `web.username/password` reload live, while changing `web.enabled` or `web.port` is rejected as restart-required.
+Responsibilities: flag parsing (`-config`, default `./config.yaml`; `-version`) → `config.Load` → assemble the Manager (implements `web.Backend`; starts an onvif.Server + rtspproxy per device; discovery.Server; when `alarm.enabled`, an alarm.Server whose OnChange maps channel N to `devices[N-1]`'s `onvif.Server.SetMotion`; snapshot function = pass-through or mediautil.Grab + Cache) → signal handling and transactional hot reload. Reload first prepares the candidate and synchronously pre-binds every SOAP/RTSP/discovery/alarm listener. A bind or persistence failure restores the old generation and leaves the old file/runtime usable; successful persistence uses a same-directory atomic rename with mode 0600. `web.username/password` reload live, while changing `web.enabled` or `web.port` is rejected as restart-required.

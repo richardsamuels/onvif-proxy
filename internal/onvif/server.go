@@ -1,7 +1,9 @@
-// Package onvif implements the ONVIF Device and Media services for a single
-// virtual device. Each device runs one http.Server bound to dev.Ports.SOAP
-// and serves POST /onvif/device_service, POST /onvif/media_service and an
-// GET /onvif/snapshot (HTTP Basic when device auth is configured). Responses
+// Package onvif implements the ONVIF Device, Media and Events services for a
+// single virtual device. Each device runs one http.Server bound to
+// dev.Ports.SOAP and serves POST /onvif/device_service, POST
+// /onvif/media_service, POST /onvif/event_service (+ pull point
+// subscriptions under /onvif/subscription/{id}) and GET /onvif/snapshot
+// (HTTP Basic when device auth is configured). Responses
 // are hand-written XML templates matching the ONVIF WSDL element definitions;
 // every dynamic value is XML-escaped. Method coverage follows docs/02 sections
 // 4 and 5.
@@ -55,6 +57,14 @@ type Server struct {
 	mux        *http.ServeMux
 	nonceMu    sync.Mutex
 	usedNonces map[[32]byte]time.Time
+
+	// Events state (events.go).
+	evMu     sync.Mutex
+	motion   bool
+	motionAt time.Time
+	subs     map[string]*subscription
+	stop     chan struct{} // closed on shutdown to release long polls
+	stopOnce sync.Once
 }
 
 // NewServer builds a Server and its route table for dev.
@@ -64,9 +74,13 @@ func NewServer(dev *config.Device, opts Options) *Server {
 		opts:       opts,
 		mux:        http.NewServeMux(),
 		usedNonces: make(map[[32]byte]time.Time),
+		subs:       make(map[string]*subscription),
+		stop:       make(chan struct{}),
 	}
 	s.mux.HandleFunc("POST /onvif/device_service", s.handleDevice)
 	s.mux.HandleFunc("POST /onvif/media_service", s.handleMedia)
+	s.mux.HandleFunc("POST /onvif/event_service", s.handleEvents)
+	s.mux.HandleFunc("POST /onvif/subscription/{id}", s.handleSubscription)
 	s.mux.HandleFunc("GET /onvif/snapshot", s.handleSnapshot)
 	return s
 }
@@ -91,6 +105,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 
 	select {
 	case <-ctx.Done():
+		s.stopOnce.Do(func() { close(s.stop) })
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)

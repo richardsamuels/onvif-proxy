@@ -8,7 +8,7 @@
 
 ```dockerfile
 # ---- build ----
-FROM golang:1.26.5-alpine AS build
+FROM golang:1.26.11-alpine AS build
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -35,11 +35,11 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 ENTRYPOINT ["onvif-proxy", "-config", "/config/config.yaml"]
 ```
 
-多架构:`linux/amd64` + `linux/arm64`(树莓派/NAS),用 `docker buildx` + GitHub Actions 发布到 GHCR。构建镜像和 CI 均使用已修复漏洞的 Go 1.26.5 工具链。应用以固定的非 root 用户 `10001:10001` 运行。健康检查探测 PID 1 进程而不是 `/healthz`,因此禁用 Web UI 或开启 Basic 认证时仍然有效。它只表示进程存活,不代表每个 ONVIF/RTSP 监听端口都已就绪。
+多架构:`linux/amd64` + `linux/arm64`(树莓派/NAS),用 `docker buildx` + GitHub Actions 发布到 GHCR。构建镜像和 CI 均使用已修复漏洞的 Go 1.26.11 工具链。应用以固定的非 root 用户 `10001:10001` 运行。健康检查探测 PID 1 进程而不是 `/healthz`,因此禁用 Web UI 或开启 Basic 认证时仍然有效。它只表示进程存活,不代表每个 ONVIF/RTSP 监听端口都已就绪。
 
 ### 环境变量
 
-全局字段支持 env 覆盖(env > yaml,仅内存生效、不写回挂载的 config.yaml;完整语义见 `docs/03-config.zh-CN.md` 第 3 节):`ONVIF_ADVERTISE_IP`、`ONVIF_DISCOVERY`、`ONVIF_WEB_ENABLED`、`ONVIF_WEB_PORT`、`ONVIF_WEB_USERNAME`、`ONVIF_WEB_PASSWORD`,以及 `CONFIG`(配置文件路径)。典型用途:compose 里直接给 Web UI 配 Basic 认证、bridge 模式下指定宿主机 IP,而不必预先手写 config.yaml。
+全局字段支持 env 覆盖(env > yaml,仅内存生效、不写回挂载的 config.yaml;完整语义见 `docs/03-config.zh-CN.md` 第 3 节):`ONVIF_ADVERTISE_IP`、`ONVIF_DISCOVERY`、`ONVIF_WEB_ENABLED`、`ONVIF_WEB_PORT`、`ONVIF_WEB_USERNAME`、`ONVIF_WEB_PASSWORD`、`ONVIF_ALARM_ENABLED`、`ONVIF_ALARM_PORT`,以及 `CONFIG`(配置文件路径)。典型用途:compose 里直接给 Web UI 配 Basic 认证、bridge 模式下指定宿主机 IP,而不必预先手写 config.yaml。
 
 ## 2. 网络模式选择(关键)
 
@@ -102,7 +102,7 @@ volumes:
 
 ### 模式 C:bridge + 手动添加(发现不可用)
 
-端口逐个映射(8080、每设备的 soap/rtsp 端口),`advertise_ip` 填宿主机 IP,`discovery: false`。客户端侧**手动按 IP:端口添加 ONVIF 设备**(Unifi Protect 支持手动录入)。适合 Mac/Windows 的 Docker Desktop(其虚拟化层本就过不了组播)。
+端口逐个映射(8080、每设备的 soap/rtsp 端口,启用报警接收器时还有 `alarm.port`,默认 8899),`advertise_ip` 填宿主机 IP,`discovery: false`。客户端侧**手动按 IP:端口添加 ONVIF 设备**(Unifi Protect 支持手动录入)。适合 Mac/Windows 的 Docker Desktop(其虚拟化层本就过不了组播)。
 
 ## 3. 多虚拟设备与 Unifi Protect
 

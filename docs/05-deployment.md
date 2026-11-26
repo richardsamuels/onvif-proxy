@@ -8,7 +8,7 @@ Multi-stage build; the final image = `alpine` + ffmpeg + a single binary, target
 
 ```dockerfile
 # ---- build ----
-FROM golang:1.26.5-alpine AS build
+FROM golang:1.26.11-alpine AS build
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -35,11 +35,11 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 ENTRYPOINT ["onvif-proxy", "-config", "/config/config.yaml"]
 ```
 
-Multi-arch: `linux/amd64` + `linux/arm64` (Raspberry Pi / NAS), built with `docker buildx` + GitHub Actions and published to GHCR. The builder and CI use the patched Go 1.26.5 toolchain. The application runs as the fixed non-root user `10001:10001`. The health check tests the PID 1 process rather than `/healthz`, so it still works when the Web UI is disabled or protected by Basic auth. It is a liveness check, not a readiness check for every configured ONVIF/RTSP listener.
+Multi-arch: `linux/amd64` + `linux/arm64` (Raspberry Pi / NAS), built with `docker buildx` + GitHub Actions and published to GHCR. The builder and CI use the patched Go 1.26.11 toolchain. The application runs as the fixed non-root user `10001:10001`. The health check tests the PID 1 process rather than `/healthz`, so it still works when the Web UI is disabled or protected by Basic auth. It is a liveness check, not a readiness check for every configured ONVIF/RTSP listener.
 
 ### Environment variables
 
-Global fields support env overrides (env > yaml, in-memory only, not written back to the mounted config.yaml; see `docs/03-config.md` §3 for the full semantics): `ONVIF_ADVERTISE_IP`, `ONVIF_DISCOVERY`, `ONVIF_WEB_ENABLED`, `ONVIF_WEB_PORT`, `ONVIF_WEB_USERNAME`, `ONVIF_WEB_PASSWORD`, and `CONFIG` (the config file path). Typical uses: setting Basic auth for the Web UI directly in the compose file, or specifying the host IP in bridge mode, without having to hand-write config.yaml beforehand.
+Global fields support env overrides (env > yaml, in-memory only, not written back to the mounted config.yaml; see `docs/03-config.md` §3 for the full semantics): `ONVIF_ADVERTISE_IP`, `ONVIF_DISCOVERY`, `ONVIF_WEB_ENABLED`, `ONVIF_WEB_PORT`, `ONVIF_WEB_USERNAME`, `ONVIF_WEB_PASSWORD`, `ONVIF_ALARM_ENABLED`, `ONVIF_ALARM_PORT`, and `CONFIG` (the config file path). Typical uses: setting Basic auth for the Web UI directly in the compose file, or specifying the host IP in bridge mode, without having to hand-write config.yaml beforehand.
 
 ## 2. Choosing a network mode (critical)
 
@@ -102,7 +102,7 @@ Multicast works; all ports are bound directly on the host, so plan around this t
 
 ### Mode C: bridge + manual add (discovery unavailable)
 
-Map ports one by one (8080, plus each device's soap/rtsp ports), set `advertise_ip` to the host IP, and set `discovery: false`. On the client side, **manually add the ONVIF device by IP:port** (Unifi Protect supports manual entry). Suitable for Docker Desktop on Mac/Windows (whose virtualization layer can't pass multicast through anyway).
+Map ports one by one (8080, each device's soap/rtsp ports, and `alarm.port`, default 8899, when the alarm receiver is enabled), set `advertise_ip` to the host IP, and set `discovery: false`. On the client side, **manually add the ONVIF device by IP:port** (Unifi Protect supports manual entry). Suitable for Docker Desktop on Mac/Windows (whose virtualization layer can't pass multicast through anyway).
 
 ## 3. Multiple virtual devices and Unifi Protect
 

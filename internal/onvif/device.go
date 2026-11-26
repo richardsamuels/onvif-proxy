@@ -78,6 +78,7 @@ func systemDateAndTime() string {
 func (s *Server) capabilities(r *http.Request) string {
 	deviceXAddr := soap.XMLEscape("http://" + s.hostPort(r) + "/onvif/device_service")
 	mediaXAddr := soap.XMLEscape("http://" + s.hostPort(r) + "/onvif/media_service")
+	eventsXAddr := soap.XMLEscape("http://" + s.hostPort(r) + "/onvif/event_service")
 	return "<tds:GetCapabilitiesResponse><tds:Capabilities>" +
 		"<tt:Device>" +
 		"<tt:XAddr>" + deviceXAddr + "</tt:XAddr>" +
@@ -85,6 +86,12 @@ func (s *Server) capabilities(r *http.Request) string {
 		"<tt:System><tt:DiscoveryResolve>false</tt:DiscoveryResolve><tt:DiscoveryBye>true</tt:DiscoveryBye><tt:RemoteDiscovery>false</tt:RemoteDiscovery><tt:SystemBackup>false</tt:SystemBackup><tt:SystemLogging>false</tt:SystemLogging><tt:FirmwareUpgrade>false</tt:FirmwareUpgrade></tt:System>" +
 		"<tt:Security><tt:TLS1.1>false</tt:TLS1.1><tt:TLS1.2>false</tt:TLS1.2><tt:OnboardKeyGeneration>false</tt:OnboardKeyGeneration><tt:AccessPolicyConfig>false</tt:AccessPolicyConfig><tt:X.509Token>false</tt:X.509Token><tt:SAMLToken>false</tt:SAMLToken><tt:KerberosToken>false</tt:KerberosToken><tt:RELToken>false</tt:RELToken></tt:Security>" +
 		"</tt:Device>" +
+		"<tt:Events>" +
+		"<tt:XAddr>" + eventsXAddr + "</tt:XAddr>" +
+		"<tt:WSSubscriptionPolicySupport>false</tt:WSSubscriptionPolicySupport>" +
+		"<tt:WSPullPointSupport>true</tt:WSPullPointSupport>" +
+		"<tt:WSPausableSubscriptionManagerInterfaceSupport>false</tt:WSPausableSubscriptionManagerInterfaceSupport>" +
+		"</tt:Events>" +
 		"<tt:Media>" +
 		"<tt:XAddr>" + mediaXAddr + "</tt:XAddr>" +
 		"<tt:StreamingCapabilities><tt:RTPMulticast>false</tt:RTPMulticast><tt:RTP_TCP>true</tt:RTP_TCP><tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP></tt:StreamingCapabilities>" +
@@ -115,6 +122,7 @@ func (s *Server) services(r *http.Request, includeCap bool) string {
 	return "<tds:GetServicesResponse>" +
 		entry(soap.NSDevice, "/onvif/device_service") +
 		entry(soap.NSMedia, "/onvif/media_service") +
+		entry(soap.NSEvents, "/onvif/event_service") +
 		"</tds:GetServicesResponse>"
 }
 

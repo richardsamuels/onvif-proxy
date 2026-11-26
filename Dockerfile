@@ -1,5 +1,5 @@
 # ---- build ----
-FROM golang:1.26.5-alpine AS build
+FROM golang:1.26.11-alpine AS build
 ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./

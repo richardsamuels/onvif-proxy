@@ -51,6 +51,7 @@ type DeviceRuntime struct {
 	Device  *config.Device
 	Running bool
 	Error   string
+	Motion  bool // current ONVIF motion state (fed by the alarm receiver)
 }
 
 // Status is the payload of GET /api/status.

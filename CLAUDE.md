@@ -11,10 +11,11 @@ Go 编写的 RTSP → ONVIF 虚拟设备代理:把任意 RTSP 流包装成 ONVIF
 每篇设计文档都是双语,命名规则与 README(`README.md` 英文 / `README.zh-CN.md` 中文)保持一致:无后缀 `docs/NN-name.md` 为**英文、默认主版本**,`docs/NN-name.zh-CN.md` 为中文版。**新增或修改设计文档时,默认先写/先改英文版,再同步中文版**(或至少保证两者同一次改动内一起提交,不允许长期只改一边);`docs/06-internal-api.md` 作为包间签名契约,任何签名变更必须双语同步。
 
 - `docs/01-architecture.md` / `docs/01-architecture.zh-CN.md` — 模块划分、数据流、目录结构、技术选型(含"为什么不用 WSDL 代码生成")
-- `docs/02-onvif-spec.md` / `docs/02-onvif-spec.zh-CN.md` — ONVIF 方法清单、Fault 语义、WSSE、WS-Discovery 细节;末尾有验收基准表
+- `docs/02-onvif-spec.md` / `docs/02-onvif-spec.zh-CN.md` — ONVIF 方法清单(Device/Media/Events)、Fault 语义、WSSE、WS-Discovery 细节;末尾有验收基准表
 - `docs/03-config.md` / `docs/03-config.zh-CN.md` — YAML 配置格式与校验规则
 - `docs/04-web-api.md` / `docs/04-web-api.zh-CN.md` — REST API 契约与 UI 设计
 - `docs/05-deployment.md` / `docs/05-deployment.zh-CN.md` — Dockerfile、macvlan/host/bridge 三种网络模式
+- `docs/08-alarm-server.md` / `docs/08-alarm-server.zh-CN.md` — TVT/ENS XML 报警服务器协议(`SendAlarmStatus` 接收器)及其到 ONVIF PullPoint 移动事件的映射
 - `docs/07-mcp.md` / `docs/07-mcp.zh-CN.md` — MCP 服务端点(基于官方 go-sdk 的 Streamable HTTP `/mcp`、工具清单、实现契约)
 
 ## 硬性约束
@@ -36,4 +37,4 @@ go run ./cmd/onvif-proxy -config config.yaml   # 本地运行(快照/预览需 P
 
 ## 验收方式
 
-实现后跑 Web UI 的"ONVIF 自检"(`POST /api/test/onvif`),对照 `docs/02-onvif-spec.md` 第 7 节的基准表,必须全绿;另需覆盖:故意调用一个不存在的方法,验证返回规范 Fault 而非裸 500。
+实现后跑 Web UI 的"ONVIF 自检"(`POST /api/test/onvif`),对照 `docs/02-onvif-spec.md` 第 8 节的基准表,必须全绿;另需覆盖:故意调用一个不存在的方法,验证返回规范 Fault 而非裸 500。

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestConfigFilesArePrivate(t *testing.T) {
@@ -315,5 +316,71 @@ func TestAlarmConfig(t *testing.T) {
 	// A disabled receiver does not claim its port.
 	if _, err := Parse([]byte(validConfigYAML + "alarm:\n  enabled: false\n  port: 8081\n")); err != nil {
 		t.Errorf("disabled alarm port should not conflict: %v", err)
+	}
+}
+
+func TestAlarmPollConfig(t *testing.T) {
+	// Poll mode does not claim alarm.port, so it may equal a device port.
+	cfg, err := Parse([]byte(validConfigYAML + "alarm:\n  enabled: true\n  port: 8081\n  poll:\n    url: http://10.0.1.57:81\n    username: admin\n    password: pw\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := cfg.Alarm.Poll
+	if p == nil || p.URL != "http://10.0.1.57:81" || p.Username != "admin" || p.Password != "pw" || p.Interval() != time.Second {
+		t.Fatalf("poll: %+v interval=%v", p, p.Interval())
+	}
+	// Credentials stored in the file survive the config write-back.
+	out, err := marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"url: http://10.0.1.57:81", "username: admin", "password: pw"} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("write-back lost %q:\n%s", want, out)
+		}
+	}
+	cfg, err = Parse([]byte(validConfigYAML + "alarm:\n  enabled: true\n  poll:\n    url: https://nvr.local/\n    interval_ms: 250\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Alarm.Poll.Interval() != 250*time.Millisecond {
+		t.Fatalf("interval = %v", cfg.Alarm.Poll.Interval())
+	}
+
+	for name, poll := range map[string]string{
+		"missing url":   "    username: admin\n    password: pw\n",
+		"bad scheme":    "    url: ftp://10.0.1.57\n",
+		"no host":       "    url: http://\n",
+		"userinfo":      "    url: http://admin:pw@10.0.1.57\n",
+		"query":         "    url: http://10.0.1.57/?a=b\n",
+		"half auth":     "    url: http://10.0.1.57\n    username: admin\n",
+		"tiny interval": "    url: http://10.0.1.57\n    interval_ms: 50\n",
+		"neg interval":  "    url: http://10.0.1.57\n    interval_ms: -1\n",
+	} {
+		if _, err := Parse([]byte(validConfigYAML + "alarm:\n  enabled: true\n  poll:\n" + poll)); err == nil {
+			t.Errorf("%s: expected validation error", name)
+		}
+	}
+}
+
+func TestAlarmPollPasswordEnv(t *testing.T) {
+	t.Setenv("ONVIF_ALARM_POLL_PASSWORD", "from-env")
+	cfg, err := Parse([]byte(validConfigYAML + "alarm:\n  enabled: true\n  poll:\n    url: http://10.0.1.57:81\n    username: admin\n    password: x\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyEnvOverrides(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Alarm.Poll.Password != "from-env" {
+		t.Fatalf("password = %q", cfg.Alarm.Poll.Password)
+	}
+	// Without a poll block the variable is ignored, not an error.
+	cfg, err = Parse([]byte(validConfigYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyEnvOverrides(cfg); err != nil || cfg.Alarm.Poll != nil {
+		t.Fatalf("no poll block: err=%v poll=%+v", err, cfg.Alarm.Poll)
 	}
 }

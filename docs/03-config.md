@@ -30,6 +30,12 @@ alarm:
   enabled: false
   port: 8899                     # The NVR POSTs /SendAlarmStatus here; motionAlarm id N -> devices[N-1]
   hold_seconds: 60               # Clear a channel not re-reported active for this long; 0 = never
+  # Poll the NVR's GetAlarmStatus instead of receiving pushes (port is then not bound).
+  # poll:
+  #   url: http://10.0.1.57:81     # NVR HTTP API base URL (http/https)
+  #   username: admin              # HTTP Basic auth; omit both for none
+  #   password: ""
+  #   interval_ms: 1000            # default 1000; minimum 100
 
 # Virtual device list — each entry = one ONVIF camera
 devices:
@@ -110,9 +116,12 @@ devices:
 
 | Field | Type | Default | Description |
 |------|------|------|------|
-| `enabled` | bool | false | Start the `SendAlarmStatus` receiver (see [08-alarm-server.md](08-alarm-server.md)) |
-| `port` | int | 8899 | Receiver TCP port, 1-65535; when enabled it is included in the global port-conflict check |
+| `enabled` | bool | false | Start the alarm integration: the `SendAlarmStatus` push receiver, or the `GetAlarmStatus` poller when `poll` is set (see [08-alarm-server.md](08-alarm-server.md)) |
+| `port` | int | 8899 | Push receiver TCP port, 1-65535; when enabled in push mode it is included in the global port-conflict check. Unused (not bound, not checked for conflicts) when `poll` is set |
 | `hold_seconds` | int | 60 | Safety timeout: a channel not re-reported `true` for this many seconds is cleared. `0` disables the timeout; negative values are rejected |
+| `poll.url` | string | — | Required when `poll` is present. The device's HTTP API base URL: `http` or `https` scheme with a host and optional port, no query or fragment (for example `http://10.0.1.57:81`). The proxy POSTs `<url>/GetAlarmStatus` |
+| `poll.username` / `poll.password` | string | empty | HTTP Basic credentials; must be set together (both empty = no `Authorization` header) |
+| `poll.interval_ms` | int | 1000 | Poll interval in milliseconds; `0` = default; values from 1 to 99 and negative values are rejected |
 
 Channel mapping: `motionAlarm id="N"` drives `devices[N-1]`, so device order in the list matters. Ids beyond the list are logged once and ignored.
 
@@ -167,6 +176,7 @@ Aimed at Docker/compose scenarios: global fields in the `server`, `web`, and `al
 | `ONVIF_WEB_PASSWORD` | `web.password` | String |
 | `ONVIF_ALARM_ENABLED` | `alarm.enabled` | `true` / `false` |
 | `ONVIF_ALARM_PORT` | `alarm.port` | 1-65535 |
+| `ONVIF_ALARM_POLL_PASSWORD` | `alarm.poll.password` (ignored unless `alarm.poll` is configured in yaml) | String |
 
 Semantics:
 

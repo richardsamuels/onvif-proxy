@@ -65,6 +65,11 @@ func ApplyEnvOverrides(cfg *Config) ([]string, error) {
 		}
 	}
 	setPort("ONVIF_ALARM_PORT", &cfg.Alarm.Port, "alarm.port")
+	// Only meaningful when the yaml configures alarm.poll; otherwise ignored so
+	// that removing the poll block through the Web UI is not rejected.
+	if cfg.Alarm.Poll != nil {
+		setStr("ONVIF_ALARM_POLL_PASSWORD", &cfg.Alarm.Poll.Password, "alarm.poll.password")
+	}
 
 	if len(errs) > 0 {
 		return applied, &ValidationError{Problems: errs}

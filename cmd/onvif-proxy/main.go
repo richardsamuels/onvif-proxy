@@ -260,12 +260,6 @@ func (m *manager) prepareGeneration(parent context.Context, cfg *config.Config, 
 	}
 
 	if cfg.Alarm.Enabled {
-		port := cfg.Alarm.ListenPort()
-		alarmLn, err := lc.Listen(genCtx, "tcp4", ":"+strconv.Itoa(port))
-		if err != nil {
-			gen.closePrepared()
-			return nil, fmt.Errorf("alarm receiver port %d: %w", port, err)
-		}
 		devices := cfg.Devices
 		var warnedMu sync.Mutex
 		warned := map[int]bool{}
@@ -287,14 +281,36 @@ func (m *manager) prepareGeneration(parent context.Context, cfg *config.Config, 
 				gen.servers[dev.UUID].SetMotion(active)
 			},
 		})
-		gen.tasks = append(gen.tasks, generationTask{
-			label: fmt.Sprintf("alarm receiver :%d", port),
-			state: &deviceState{running: true},
-			ln:    alarmLn,
-			run: func(ctx context.Context) error {
-				return recv.Serve(ctx, alarmLn)
-			},
-		})
+		if p := cfg.Alarm.Poll; p != nil {
+			opts := alarm.PollOptions{
+				URL:      p.URL,
+				Username: p.Username,
+				Password: p.Password,
+				Interval: p.Interval(),
+			}
+			gen.tasks = append(gen.tasks, generationTask{
+				label: fmt.Sprintf("alarm poller %s every %s", p.URL, opts.Interval),
+				state: &deviceState{running: true},
+				run: func(ctx context.Context) error {
+					return recv.Poll(ctx, opts)
+				},
+			})
+		} else {
+			port := cfg.Alarm.ListenPort()
+			alarmLn, err := lc.Listen(genCtx, "tcp4", ":"+strconv.Itoa(port))
+			if err != nil {
+				gen.closePrepared()
+				return nil, fmt.Errorf("alarm receiver port %d: %w", port, err)
+			}
+			gen.tasks = append(gen.tasks, generationTask{
+				label: fmt.Sprintf("alarm receiver :%d", port),
+				state: &deviceState{running: true},
+				ln:    alarmLn,
+				run: func(ctx context.Context) error {
+					return recv.Serve(ctx, alarmLn)
+				},
+			})
+		}
 	}
 	return gen, nil
 }
@@ -326,7 +342,9 @@ func (g *generation) activate() {
 func (g *generation) closePrepared() {
 	g.cancel()
 	for _, task := range g.tasks {
-		_ = task.ln.Close()
+		if task.ln != nil { // pollers have no listener
+			_ = task.ln.Close()
+		}
 	}
 	if !g.activated {
 		close(g.done)

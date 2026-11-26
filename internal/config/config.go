@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -43,22 +44,45 @@ type WebConfig struct {
 
 func (w WebConfig) IsEnabled() bool { return w.Enabled == nil || *w.Enabled }
 
-// AlarmConfig configures the TVT/ENS XML alarm-server receiver
-// (POST /SendAlarmStatus, docs/08-alarm-server.md). motionAlarm id=N drives
-// the ONVIF motion state of Devices[N-1].
+// AlarmConfig configures the TVT/ENS XML alarm integration
+// (docs/08-alarm-server.md): the POST /SendAlarmStatus push receiver, or a
+// GetAlarmStatus poller when Poll is set. motionAlarm id=N drives the ONVIF
+// motion state of Devices[N-1].
 type AlarmConfig struct {
 	Enabled bool `yaml:"enabled,omitempty"`
-	// Port is the HTTP listen port. 0 = DefaultAlarmPort.
+	// Port is the push receiver's HTTP listen port. 0 = DefaultAlarmPort.
+	// Unused when Poll is set.
 	Port int `yaml:"port,omitempty"`
 	// HoldSeconds clears a channel that has not been re-reported active for
 	// this long. nil = DefaultAlarmHoldSeconds; 0 disables the timeout.
 	HoldSeconds *int `yaml:"hold_seconds,omitempty"`
+	// Poll, when set, polls the device instead of listening for pushes.
+	Poll *AlarmPollConfig `yaml:"poll,omitempty"`
+}
+
+// AlarmPollConfig polls <URL>/GetAlarmStatus with HTTP Basic auth.
+type AlarmPollConfig struct {
+	URL      string `yaml:"url"`
+	Username string `yaml:"username,omitempty"`
+	Password string `yaml:"password,omitempty"`
+	// IntervalMS is the poll interval. 0 = DefaultAlarmPollIntervalMS.
+	IntervalMS int `yaml:"interval_ms,omitempty"`
 }
 
 const (
-	DefaultAlarmPort        = 8899
-	DefaultAlarmHoldSeconds = 60
+	DefaultAlarmPort           = 8899
+	DefaultAlarmHoldSeconds    = 60
+	DefaultAlarmPollIntervalMS = 1000
+	MinAlarmPollIntervalMS     = 100
 )
+
+// Interval returns the configured poll interval or the default.
+func (p AlarmPollConfig) Interval() time.Duration {
+	if p.IntervalMS == 0 {
+		return DefaultAlarmPollIntervalMS * time.Millisecond
+	}
+	return time.Duration(p.IntervalMS) * time.Millisecond
+}
 
 // ListenPort returns the configured port or DefaultAlarmPort.
 func (a AlarmConfig) ListenPort() int {
@@ -436,11 +460,24 @@ func (c *Config) Validate() error {
 	if c.Alarm.Port < 0 {
 		add("alarm: port %d out of range", c.Alarm.Port)
 	}
-	if c.Alarm.Enabled {
+	if c.Alarm.Enabled && c.Alarm.Poll == nil {
 		claim(c.Alarm.ListenPort(), "alarm")
 	}
 	if c.Alarm.HoldSeconds != nil && *c.Alarm.HoldSeconds < 0 {
 		add("alarm.hold_seconds: must not be negative")
+	}
+	if p := c.Alarm.Poll; p != nil {
+		if u, err := url.Parse(p.URL); p.URL == "" || err != nil ||
+			(u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+			u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			add("alarm.poll.url: must be an http(s) URL with a host and no credentials, query or fragment")
+		}
+		if (p.Username == "") != (p.Password == "") {
+			add("alarm.poll: username and password must be set together")
+		}
+		if p.IntervalMS < 0 || (p.IntervalMS > 0 && p.IntervalMS < MinAlarmPollIntervalMS) {
+			add("alarm.poll.interval_ms: must be 0 (default) or at least %d", MinAlarmPollIntervalMS)
+		}
 	}
 
 	names := map[string]bool{}

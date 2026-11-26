@@ -1,7 +1,7 @@
-// Package alarm implements a receiver for the TVT / ENS XML alarm-server
-// protocol: devices POST their alarm status to /SendAlarmStatus and the
-// receiver tracks per-channel motion state, reporting transitions through a
-// callback. See docs/08-alarm-server.md.
+// Package alarm implements the TVT / ENS XML alarm-status protocol: devices
+// either POST their alarm status to /SendAlarmStatus (push) or are polled with
+// GetAlarmStatus (poll). The Server tracks per-channel motion state and reports
+// transitions through a callback. See docs/08-alarm-server.md.
 package alarm
 
 import (
@@ -9,7 +9,9 @@ import (
 	"context"
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"sort"
@@ -25,6 +27,8 @@ const (
 	readTimeout       = 15 * time.Second
 	idleTimeout       = 60 * time.Second
 	expiryInterval    = time.Second
+	pollTimeout       = 5 * time.Second
+	defaultPollEvery  = time.Second
 
 	respSuccess   = `<?xml version="1.0" encoding="UTF-8"?><config status="success"/>`
 	respBadFormat = `<?xml version="1.0" encoding="UTF-8"?><config status="failed" errorCode="2"/>`
@@ -54,13 +58,19 @@ func NewServer(opts Options) *Server {
 	return &Server{opts: opts, now: time.Now, lastSeen: make(map[int]time.Time)}
 }
 
+// ErrNoStatus is returned by Parse for a well-formed document that has no
+// alarmStatusInfo element (a heartbeat, or a failed-result document). Such a
+// document carries no motion state and must not be applied.
+var ErrNoStatus = errors.New("alarm: document has no alarmStatusInfo")
+
 // Parse extracts every motionAlarm id -> state pair from a SendAlarmStatus
-// body. Elements match by local name; entries with an invalid id or value are
-// skipped. A body that is not well-formed XML is an error.
+// body or GetAlarmStatus response. Elements match by local name; entries with
+// an invalid id or value are skipped. A body that is not well-formed XML is an
+// error; one without alarmStatusInfo returns ErrNoStatus.
 func Parse(body []byte) (map[int]bool, error) {
 	out := make(map[int]bool)
 	dec := xml.NewDecoder(bytes.NewReader(body))
-	sawRoot := false
+	sawRoot, sawStatus := false, false
 	for {
 		tok, err := dec.Token()
 		if err == io.EOF {
@@ -74,6 +84,9 @@ func Parse(body []byte) (map[int]bool, error) {
 			continue
 		}
 		sawRoot = true
+		if se.Name.Local == "alarmStatusInfo" {
+			sawStatus = true
+		}
 		if se.Name.Local != "motionAlarm" {
 			continue
 		}
@@ -98,6 +111,9 @@ func Parse(body []byte) (map[int]bool, error) {
 	}
 	if !sawRoot {
 		return nil, errors.New("alarm: empty document")
+	}
+	if !sawStatus {
+		return nil, ErrNoStatus
 	}
 	return out, nil
 }
@@ -194,12 +210,14 @@ func (s *Server) handleSendAlarmStatus(w http.ResponseWriter, r *http.Request) {
 		motion, err = Parse(body)
 	}
 	w.Header().Set("Content-Type", "application/xml")
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrNoStatus) {
 		w.WriteHeader(http.StatusBadRequest)
 		io.WriteString(w, respBadFormat)
 		return
 	}
-	s.Apply(motion)
+	if err == nil {
+		s.Apply(motion)
+	}
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, respSuccess)
 }
@@ -235,4 +253,105 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			s.expire()
 		}
 	}
+}
+
+// PollOptions configures Poll.
+type PollOptions struct {
+	// URL is the device API base URL; requests go to URL + "/GetAlarmStatus".
+	URL string
+	// Username/Password are sent as HTTP Basic auth when Username is set.
+	Username, Password string
+	// Interval between poll starts; <= 0 means 1s.
+	Interval time.Duration
+	// Client overrides the HTTP client (tests); nil uses a 5s-timeout client.
+	Client *http.Client
+}
+
+// Poll fetches GetAlarmStatus every Interval and applies each status document
+// as a snapshot, and runs the hold-timeout loop, until ctx is cancelled. A
+// failed poll changes no state; failures are logged on the first failure and
+// on recovery only.
+func (s *Server) Poll(ctx context.Context, opts PollOptions) error {
+	interval := opts.Interval
+	if interval <= 0 {
+		interval = defaultPollEvery
+	}
+	client := opts.Client
+	if client == nil {
+		client = &http.Client{Timeout: pollTimeout}
+	}
+	endpoint := strings.TrimRight(opts.URL, "/") + "/GetAlarmStatus"
+
+	pollTick := time.NewTicker(interval)
+	defer pollTick.Stop()
+	expiryTick := time.NewTicker(expiryInterval)
+	defer expiryTick.Stop()
+
+	var lastErr string
+	healthy := true
+	for {
+		err := s.pollOnce(ctx, client, endpoint, opts)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		switch {
+		case err != nil && (healthy || err.Error() != lastErr):
+			log.Printf("alarm: poll %s failed: %v", endpoint, err)
+			healthy, lastErr = false, err.Error()
+		case err == nil && !healthy:
+			log.Printf("alarm: poll %s recovered", endpoint)
+			healthy, lastErr = true, ""
+		}
+	wait:
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-expiryTick.C:
+				s.expire()
+			case <-pollTick.C:
+				break wait
+			}
+		}
+	}
+}
+
+func (s *Server) pollOnce(ctx context.Context, client *http.Client, endpoint string, opts PollOptions) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	if opts.Username != "" {
+		req.SetBasicAuth(opts.Username, opts.Password)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(body) > maxBodyBytes {
+		return fmt.Errorf("response larger than %d bytes", maxBodyBytes)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet(body))
+	}
+	motion, err := Parse(body)
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, snippet(body))
+	}
+	s.Apply(motion)
+	return nil
+}
+
+// snippet returns a short single-line excerpt of a response body for logs.
+func snippet(b []byte) string {
+	s := strings.Join(strings.Fields(string(b)), " ")
+	if len(s) > 200 {
+		s = s[:200] + "…"
+	}
+	return strconv.Quote(s)
 }

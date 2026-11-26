@@ -15,7 +15,7 @@
 - **如实声明编码** —— 每个 Profile 在配置、Options 和保证实例计数中一致声明 H.264、JPEG/MJPEG 或 MPEG-4。ONVIF Profile S 没有 H.265 编码器类型,因此会明确拒绝 H.265/HEVC。
 - **快照支持** —— `GetSnapshotUri` 开箱即用:真实摄像头自带 HTTP 快照接口则直接透传,没有则由内置 ffmpeg 从 RTSP 流抓取 JPEG 帧(带短 TTL 缓存)。补上了上游项目缺失的能力。
 - **WS-Discovery** —— UDP 3702 组播发现,Hello / Bye / ProbeMatches 齐全,客户端可自动发现虚拟设备。
-- **TVT / ENS NVR 移动侦测事件** —— 可选的内置报警服务器接收 NVR 推送的 XML `SendAlarmStatus`,把 `motionAlarm id=N` 转为第 N 台虚拟设备上的 ONVIF PullPoint 移动事件(`tns1:RuleEngine/CellMotionDetector/Motion`、`tns1:VideoSource/MotionAlarm`),见 [docs/08-alarm-server.zh-CN.md](docs/08-alarm-server.zh-CN.md)。
+- **TVT / ENS NVR 移动侦测事件** —— 可选的内置报警服务器接收 NVR 推送的 XML `SendAlarmStatus`(NVR 无法推送时也可每秒轮询其 `GetAlarmStatus`),把 `motionAlarm id=N` 转为第 N 台虚拟设备上的 ONVIF PullPoint 移动事件(`tns1:RuleEngine/CellMotionDetector/Motion`、`tns1:VideoSource/MotionAlarm`),见 [docs/08-alarm-server.zh-CN.md](docs/08-alarm-server.zh-CN.md)。
 - **零转码 RTSP 代理** —— 每设备一个 TCP 透传代理,字节原样转发到真实摄像头;不解码不转码,无 CPU 开销。ffmpeg 仅用于快照与 UI 预览。
 - **Web UI** —— 除 YAML 配置文件外,内嵌小型 Web 后端:在线编辑配置、RTSP 连通性探测(原生 RTSP 客户端,支持 Digest/Basic 认证与 SDP 解析)、抓取快照、MJPEG 实时预览、对虚拟设备本身做 ONVIF 自检。
 - **事务式热重载** —— 配置变更会先完成校验和 listener 预留再提交;绑定或落盘失败会恢复旧运行态,旧配置文件保持不变。

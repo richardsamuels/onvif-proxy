@@ -15,7 +15,7 @@ Go 编写的 RTSP → ONVIF 虚拟设备代理:把任意 RTSP 流包装成 ONVIF
 - `docs/03-config.md` / `docs/03-config.zh-CN.md` — YAML 配置格式与校验规则
 - `docs/04-web-api.md` / `docs/04-web-api.zh-CN.md` — REST API 契约与 UI 设计
 - `docs/05-deployment.md` / `docs/05-deployment.zh-CN.md` — Dockerfile、macvlan/host/bridge 三种网络模式
-- `docs/08-alarm-server.md` / `docs/08-alarm-server.zh-CN.md` — TVT/ENS XML 报警服务器协议(`SendAlarmStatus` 接收器)及其到 ONVIF PullPoint 移动事件的映射
+- `docs/08-alarm-server.md` / `docs/08-alarm-server.zh-CN.md` — TVT/ENS XML 报警服务器协议(`SendAlarmStatus` 推送接收器 / `GetAlarmStatus` 轮询器)及其到 ONVIF PullPoint 移动事件的映射
 - `docs/07-mcp.md` / `docs/07-mcp.zh-CN.md` — MCP 服务端点(基于官方 go-sdk 的 Streamable HTTP `/mcp`、工具清单、实现契约)
 
 ## 硬性约束

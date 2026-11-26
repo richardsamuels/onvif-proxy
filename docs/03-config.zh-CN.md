@@ -29,6 +29,12 @@ alarm:
   enabled: false
   port: 8899                     # NVR 向此端口 POST /SendAlarmStatus;motionAlarm id N -> devices[N-1]
   hold_seconds: 60               # 通道超过此时长未再报 true 则自动清除;0 = 不超时
+  # 改为轮询 NVR 的 GetAlarmStatus,不再接收推送(此时不绑定 port)。
+  # poll:
+  #   url: http://10.0.1.57:81     # NVR HTTP API 基础 URL(http/https)
+  #   username: admin              # HTTP Basic 认证;两者都省略 = 不认证
+  #   password: ""
+  #   interval_ms: 1000            # 默认 1000;最小 100
 
 # 虚拟设备列表,每台 = 一个 ONVIF 摄像机
 devices:
@@ -108,9 +114,12 @@ devices:
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `enabled` | bool | false | 启动 `SendAlarmStatus` 接收器(见 [08-alarm-server.zh-CN.md](08-alarm-server.zh-CN.md)) |
-| `port` | int | 8899 | 接收器 TCP 端口,1-65535;启用时参与全局端口冲突校验 |
+| `enabled` | bool | false | 启用报警集成:`SendAlarmStatus` 推送接收器,或在配置了 `poll` 时启用 `GetAlarmStatus` 轮询器(见 [08-alarm-server.zh-CN.md](08-alarm-server.zh-CN.md)) |
+| `port` | int | 8899 | 推送接收器 TCP 端口,1-65535;推送模式启用时参与全局端口冲突校验。配置了 `poll` 时不使用(不绑定,也不参与冲突校验) |
 | `hold_seconds` | int | 60 | 安全超时:通道超过该秒数未再报 `true` 即被清除。`0` 关闭超时;负数被拒绝 |
+| `poll.url` | string | — | 存在 `poll` 时必填。设备 HTTP API 的基础 URL:`http` 或 `https`,含主机与可选端口,不得带 query 或 fragment(例如 `http://10.0.1.57:81`)。代理会 POST `<url>/GetAlarmStatus` |
+| `poll.username` / `poll.password` | string | 空 | HTTP Basic 凭证;必须同时设置(都为空 = 不发送 `Authorization` 头) |
+| `poll.interval_ms` | int | 1000 | 轮询间隔(毫秒);`0` = 默认;1 到 99 以及负数被拒绝 |
 
 通道映射:`motionAlarm id="N"` 驱动 `devices[N-1]`,因此设备在列表中的顺序有意义。超出列表的 id 只记录一次日志并忽略。
 
@@ -165,6 +174,7 @@ YAML 只允许一个文档。设备或流中的 `null` 项、未知字段、额�
 | `ONVIF_WEB_PASSWORD` | `web.password` | 字符串 |
 | `ONVIF_ALARM_ENABLED` | `alarm.enabled` | `true` / `false` |
 | `ONVIF_ALARM_PORT` | `alarm.port` | 1-65535 |
+| `ONVIF_ALARM_POLL_PASSWORD` | `alarm.poll.password`(yaml 中未配置 `alarm.poll` 时忽略) | 字符串 |
 
 语义:
 

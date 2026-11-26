@@ -10,9 +10,11 @@
 
 ```go
 type Config struct { Server ServerConfig; Web WebConfig; Alarm AlarmConfig; Devices []*Device }
-type AlarmConfig struct { Enabled bool; Port int; HoldSeconds *int } // yaml: alarm.enabled/port/hold_seconds
+type AlarmConfig struct { Enabled bool; Port int; HoldSeconds *int; Poll *AlarmPollConfig } // yaml: alarm.enabled/port/hold_seconds/poll
+type AlarmPollConfig struct { URL, Username, Password string; IntervalMS int } // yaml: url/username/password/interval_ms
 func (a AlarmConfig) ListenPort() int // Port;为 0 时取 DefaultAlarmPort(8899)
 func (a AlarmConfig) Hold() int       // 秒;nil -> DefaultAlarmHoldSeconds(60),0 = 关闭
+func (p AlarmPollConfig) Interval() time.Duration // IntervalMS;为 0 时取 DefaultAlarmPollIntervalMS(1000)
 func Load(path string) (*Config, error)          // 读+校验+生成 uuid/mac 并写回
 func Parse(data []byte) (*Config, error)         // 严格解析+校验(dry-run 用)
 func Prepare(data []byte) (*Config, []byte, error) // 解析+校验+生成身份,返回规范 YAML 且不落盘
@@ -121,14 +123,23 @@ type Options struct {
 }
 
 func NewServer(opts Options) *Server
-func Parse(body []byte) (map[int]bool, error) // motionAlarm id -> 状态;非法条目跳过;XML 格式错误/空文档 -> error
+var ErrNoStatus error                          // Parse:格式合法但不含 alarmStatusInfo 元素的文档
+func Parse(body []byte) (map[int]bool, error) // motionAlarm id -> 状态;非法条目跳过;XML 格式错误/空文档 -> error;无 alarmStatusInfo -> ErrNoStatus
 func (s *Server) Apply(motion map[int]bool)   // 快照语义:true = 触发,false/缺失 = 未触发;变化按通道号排序回调
 func (s *Server) Active() []int               // 当前触发的通道(已排序)
 func (s *Server) Handler() http.Handler       // POST /SendAlarmStatus;其他方法 405,其他路径 404
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error // 在已绑定的 listener 上服务,并运行 hold 超时循环(1s 一次)
+
+type PollOptions struct {
+    URL                string        // 设备 API 基础 URL;请求发往 URL + "/GetAlarmStatus"
+    Username, Password string        // HTTP Basic;Username 为空 = 不发送 Authorization 头
+    Interval           time.Duration // <= 0 -> 1s
+    Client             *http.Client  // nil -> 超时 5s 的 client
+}
+func (s *Server) Poll(ctx context.Context, opts PollOptions) error // 轮询直到 ctx 取消(返回 ctx.Err()),并运行 hold 超时循环;轮询失败不改变状态
 ```
 
-报文格式与状态语义见 docs/08-alarm-server.zh-CN.md。成功 → 200 `<config status="success"/>`;XML 格式错误或请求体 >64 KiB → 400 `<config status="failed" errorCode="2"/>`。无认证。
+报文格式与状态语义见 docs/08-alarm-server.zh-CN.md。推送:成功(包括 ErrNoStatus 文档,确认但不应用)→ 200 `<config status="success"/>`;XML 格式错误或请求体 >64 KiB → 400 `<config status="failed" errorCode="2"/>`。无认证。轮询:只应用 HTTP 200 的状态文档;失败在首次失败与恢复时记录日志。
 
 ## internal/discovery(WS-Discovery)
 
@@ -258,4 +269,4 @@ REST 路由与语义见 docs/04(`/api/config`、`/api/devices`、`/api/test/rtsp
 
 ## cmd/onvif-proxy(main,集成层,最后实现)
 
-职责:flag 解析(`-config`,默认 `./config.yaml`;`-version`)→ `config.Load` → 组装 Manager(实现 `web.Backend`;每设备起 onvif.Server + rtspproxy;discovery.Server;`alarm.enabled` 时起 alarm.Server,其 OnChange 把通道 N 映射到 `devices[N-1]` 的 `onvif.Server.SetMotion`;快照函数 = 透传 or mediautil.Grab + Cache)→ 信号处理与事务式热重载。重载先准备候选配置并同步预绑定全部 SOAP/RTSP/discovery/alarm listener;绑定或落盘失败会恢复旧 generation,保留可用的旧运行态与旧文件;成功时用同目录原子 rename 且权限为 0600。`web.username/password` 可热更新,`web.enabled` 或 `web.port` 变更则明确要求重启。
+职责:flag 解析(`-config`,默认 `./config.yaml`;`-version`)→ `config.Load` → 组装 Manager(实现 `web.Backend`;每设备起 onvif.Server + rtspproxy;discovery.Server;`alarm.enabled` 时起 alarm.Server,其 OnChange 把通道 N 映射到 `devices[N-1]` 的 `onvif.Server.SetMotion`,配置了 `alarm.poll` 时以 `Poll` 运行(不绑定 listener),否则以 `Serve` 运行;快照函数 = 透传 or mediautil.Grab + Cache)→ 信号处理与事务式热重载。重载先准备候选配置并同步预绑定全部 SOAP/RTSP/discovery/alarm listener;绑定或落盘失败会恢复旧 generation,保留可用的旧运行态与旧文件;成功时用同目录原子 rename 且权限为 0600。`web.username/password` 可热更新,`web.enabled` 或 `web.port` 变更则明确要求重启。

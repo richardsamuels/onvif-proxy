@@ -19,13 +19,20 @@ web:
   username: ""
   password: ""
 
-# Optional TVT / ENS XML alarm-server receiver (docs/08-alarm-server.md).
-# Point the NVR's alarm server at <proxy-ip>:8899; motionAlarm id N drives
-# devices[N-1] and is exposed as ONVIF PullPoint motion events.
+# Optional TVT / ENS XML alarm integration (docs/08-alarm-server.md).
+# motionAlarm id N drives devices[N-1] and is exposed as ONVIF PullPoint
+# motion events. Push mode: point the NVR's alarm server at <proxy-ip>:8899.
+# Poll mode: uncomment poll to call the NVR's GetAlarmStatus instead (port is
+# then not bound).
 alarm:
   enabled: false
   port: 8899
   hold_seconds: 60
+  # poll:
+  #   url: http://192.168.1.50:80   # NVR HTTP API base URL
+  #   username: admin
+  #   password: ""                  # or ONVIF_ALARM_POLL_PASSWORD
+  #   interval_ms: 1000
 
 devices:
   - name: "Garage Camera"

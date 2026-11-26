@@ -10,9 +10,11 @@ Module path: `github.com/Aiaid/onvif-proxy`. Dependency rules: every package may
 
 ```go
 type Config struct { Server ServerConfig; Web WebConfig; Alarm AlarmConfig; Devices []*Device }
-type AlarmConfig struct { Enabled bool; Port int; HoldSeconds *int } // yaml: alarm.enabled/port/hold_seconds
+type AlarmConfig struct { Enabled bool; Port int; HoldSeconds *int; Poll *AlarmPollConfig } // yaml: alarm.enabled/port/hold_seconds/poll
+type AlarmPollConfig struct { URL, Username, Password string; IntervalMS int } // yaml: url/username/password/interval_ms
 func (a AlarmConfig) ListenPort() int // Port, or DefaultAlarmPort (8899) when 0
 func (a AlarmConfig) Hold() int       // seconds; nil -> DefaultAlarmHoldSeconds (60), 0 = disabled
+func (p AlarmPollConfig) Interval() time.Duration // IntervalMS, or DefaultAlarmPollIntervalMS (1000) when 0
 func Load(path string) (*Config, error)          // read + validate + generate uuid/mac and persist
 func Parse(data []byte) (*Config, error)         // strict parse + validate (for dry-run)
 func Prepare(data []byte) (*Config, []byte, error) // parse + validate + generate identity; returns canonical YAML without writing
@@ -120,14 +122,23 @@ type Options struct {
 }
 
 func NewServer(opts Options) *Server
-func Parse(body []byte) (map[int]bool, error) // motionAlarm id -> state; bad entries skipped; malformed/empty XML -> error
+var ErrNoStatus error                          // Parse: well-formed document without an alarmStatusInfo element
+func Parse(body []byte) (map[int]bool, error) // motionAlarm id -> state; bad entries skipped; malformed/empty XML -> error; no alarmStatusInfo -> ErrNoStatus
 func (s *Server) Apply(motion map[int]bool)   // snapshot semantics: true = active, false/absent = inactive; transitions sorted by channel
 func (s *Server) Active() []int               // sorted active channels
 func (s *Server) Handler() http.Handler       // POST /SendAlarmStatus; other methods 405, other paths 404
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error // serves an already-bound listener and runs the hold-timeout loop (1s tick)
+
+type PollOptions struct {
+    URL                string        // device API base URL; requests go to URL + "/GetAlarmStatus"
+    Username, Password string        // HTTP Basic; empty Username = no Authorization header
+    Interval           time.Duration // <= 0 -> 1s
+    Client             *http.Client  // nil -> a client with a 5s timeout
+}
+func (s *Server) Poll(ctx context.Context, opts PollOptions) error // polls until ctx is cancelled (returns ctx.Err()) and runs the hold-timeout loop; failed polls change no state
 ```
 
-Wire format and state semantics: docs/08-alarm-server.md. Success → 200 `<config status="success"/>`; malformed or >64 KiB body → 400 `<config status="failed" errorCode="2"/>`. No authentication.
+Wire format and state semantics: docs/08-alarm-server.md. Push: success (including an ErrNoStatus document, which is acknowledged but not applied) → 200 `<config status="success"/>`; malformed or >64 KiB body → 400 `<config status="failed" errorCode="2"/>`. No authentication. Poll: only an HTTP 200 status document is applied; failures are logged on the first failure and on recovery.
 
 ## internal/discovery (WS-Discovery)
 
@@ -263,4 +274,4 @@ See docs/04-web-api.md for REST routes and semantics (`/api/config`, `/api/devic
 
 ## cmd/onvif-proxy (main, integration layer, implemented last)
 
-Responsibilities: flag parsing (`-config`, default `./config.yaml`; `-version`) → `config.Load` → assemble the Manager (implements `web.Backend`; starts an onvif.Server + rtspproxy per device; discovery.Server; when `alarm.enabled`, an alarm.Server whose OnChange maps channel N to `devices[N-1]`'s `onvif.Server.SetMotion`; snapshot function = pass-through or mediautil.Grab + Cache) → signal handling and transactional hot reload. Reload first prepares the candidate and synchronously pre-binds every SOAP/RTSP/discovery/alarm listener. A bind or persistence failure restores the old generation and leaves the old file/runtime usable; successful persistence uses a same-directory atomic rename with mode 0600. `web.username/password` reload live, while changing `web.enabled` or `web.port` is rejected as restart-required.
+Responsibilities: flag parsing (`-config`, default `./config.yaml`; `-version`) → `config.Load` → assemble the Manager (implements `web.Backend`; starts an onvif.Server + rtspproxy per device; discovery.Server; when `alarm.enabled`, an alarm.Server whose OnChange maps channel N to `devices[N-1]`'s `onvif.Server.SetMotion`, run with `Poll` when `alarm.poll` is set (no listener bound) and with `Serve` otherwise; snapshot function = pass-through or mediautil.Grab + Cache) → signal handling and transactional hot reload. Reload first prepares the candidate and synchronously pre-binds every SOAP/RTSP/discovery/alarm listener. A bind or persistence failure restores the old generation and leaves the old file/runtime usable; successful persistence uses a same-directory atomic rename with mode 0600. `web.username/password` reload live, while changing `web.enabled` or `web.port` is rejected as restart-required.

@@ -58,7 +58,7 @@
 | **SOAP layer** | Parses the SOAP Envelope (method name, WSSE header, parameters), routes to a handler, renders the XML response template; unified Fault generation |
 | **WS-Discovery** | A single UDP listener answers on behalf of all virtual devices; implements Hello/Bye/Probe→ProbeMatches |
 | **Event Service** | Per-device ONVIF PullPoint events (`/onvif/event_service`); holds the device's motion state and per-subscription queues |
-| **Alarm Receiver** | Optional HTTP listener (`alarm.port`) for TVT/ENS `SendAlarmStatus` pushes; maps `motionAlarm id=N` to `devices[N-1]` and drives its Event Service — see docs/08-alarm-server.md |
+| **Alarm Receiver** | Optional HTTP listener (`alarm.port`) for TVT/ENS `SendAlarmStatus` pushes, or a poller of the device's `GetAlarmStatus` (`alarm.poll`); maps `motionAlarm id=N` to `devices[N-1]` and drives its Event Service — see docs/08-alarm-server.md |
 | **RTSP TCP Proxy** | `io.Copy` bidirectional pass-through to the real camera's RTSP port; RTSP auth is end-to-end (client credentials go straight through to the real camera) |
 | **Web Server** | REST API + embedded UI; native RTSP probing (OPTIONS/DESCRIBE + Digest auth); invokes ffmpeg to provide snapshots and MJPEG preview; ONVIF self-test; embeds the `/mcp` endpoint, exposing 12 MCP tools (device CRUD, RTSP probe, snapshot, ONVIF self-test, etc.) — see docs/07-mcp.md for details |
 
@@ -111,6 +111,7 @@ See docs/07-mcp.md for the detailed tool list, authentication, and error semanti
 
 ```
 NVR ──POST /SendAlarmStatus (motionAlarm id=N)──▶ Alarm Receiver (alarm.port)
+NVR ◀──POST /GetAlarmStatus every 1s──────────── Alarm Poller (alarm.poll)
   └─ snapshot diff + hold timeout ──▶ devices[N-1] onvif.Server.SetMotion(active)
        └─ queue "Changed" on every pull point
 Client ──CreatePullPointSubscription / PullMessages (long poll)──▶ Event Service

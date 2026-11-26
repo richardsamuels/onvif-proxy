@@ -55,7 +55,7 @@
 | **SOAP 层** | 解析 SOAP Envelope(方法名、WSSE 头、参数),路由到 handler,渲染 XML 响应模板;统一 Fault 生成 |
 | **WS-Discovery** | 单个 UDP 监听器代答所有虚拟设备;实现 Hello/Bye/Probe→ProbeMatches |
 | **Event Service** | 每设备的 ONVIF PullPoint 事件(`/onvif/event_service`);持有该设备的移动侦测状态与各订阅的消息队列 |
-| **报警接收器** | 可选 HTTP 监听(`alarm.port`),接收 TVT/ENS `SendAlarmStatus` 推送;把 `motionAlarm id=N` 映射到 `devices[N-1]` 并驱动其 Event Service,见 docs/08-alarm-server.zh-CN.md |
+| **报警接收器** | 可选 HTTP 监听(`alarm.port`),接收 TVT/ENS `SendAlarmStatus` 推送,或轮询设备的 `GetAlarmStatus`(`alarm.poll`);把 `motionAlarm id=N` 映射到 `devices[N-1]` 并驱动其 Event Service,见 docs/08-alarm-server.zh-CN.md |
 | **RTSP TCP Proxy** | `io.Copy` 双向透传到真实摄像头的 RTSP 端口;RTSP 认证端到端(客户端凭证直达真实摄像头) |
 | **Web Server** | REST API + 内嵌 UI;RTSP 原生探测(OPTIONS/DESCRIBE + Digest 认证);调用 ffmpeg 提供快照与 MJPEG 预览;ONVIF 自检;内嵌 `/mcp` 端点,暴露 12 个 MCP 工具(设备增删改查、RTSP 探测、快照、ONVIF 自检等),详见 docs/07-mcp.zh-CN.md |
 
@@ -108,6 +108,7 @@ AI 客户端(如 Claude Code)──POST /mcp(JSON-RPC)──▶ go-sdk(Streamabl
 
 ```
 NVR ──POST /SendAlarmStatus (motionAlarm id=N)──▶ 报警接收器 (alarm.port)
+NVR ◀──每 1s POST /GetAlarmStatus──────────────── 报警轮询器 (alarm.poll)
   └─ 快照比对 + hold 超时 ──▶ devices[N-1] onvif.Server.SetMotion(active)
        └─ 向所有 pull point 入队 "Changed"
 客户端 ──CreatePullPointSubscription / PullMessages(长轮询)──▶ Event Service
